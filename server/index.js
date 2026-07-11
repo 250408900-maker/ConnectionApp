@@ -77,6 +77,34 @@ io.on("connection", (socket) => {
     console.log(`${socket.id} joined session ${cleanedCode}`);
   });
 
+  socket.on("send-message", ({ sessionCode, message }) => {
+    const cleanedCode = String(sessionCode).trim().toUpperCase();
+    const cleanedMessage = String(message).trim();
+    const session = sessions[cleanedCode];
+
+    if (!session) {
+      socket.emit("message-error", "Session not found.");
+      return;
+    }
+
+    if (!cleanedMessage) {
+      socket.emit("message-error", "Message cannot be empty.");
+      return;
+    }
+
+    const belongsToSession =
+      session.hostId === socket.id || session.guestId === socket.id;
+
+    if (!belongsToSession) {
+      socket.emit("message-error", "You are not part of this session.");
+      return;
+    }
+
+    socket.to(cleanedCode).emit("receive-message", cleanedMessage);
+
+    console.log(`Message sent in ${cleanedCode}: ${cleanedMessage}`);
+  });
+
   socket.on("disconnect", () => {
     console.log("Device disconnected:", socket.id);
 
