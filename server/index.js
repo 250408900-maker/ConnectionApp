@@ -13,6 +13,7 @@ const io = new Server(server, {
 });
 
 const sessions = {};
+const RECONNECT_GRACE_MS = 20000;
 
 function generateCode() {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -23,6 +24,19 @@ function generateCode() {
   }
 
   return code;
+}
+
+function endSession(code, reason) {
+  const session = sessions[code];
+  if (!session) return;
+
+  if (session.timers.host) clearTimeout(session.timers.host);
+  if (session.timers.guest) clearTimeout(session.timers.guest);
+
+  io.to(code).emit("session-ended", reason || "closed");
+  delete sessions[code];
+
+  console.log(`Session ${code} ended (${reason || "closed"})`);
 }
 
 io.on("connection", (socket) => {
@@ -38,6 +52,9 @@ io.on("connection", (socket) => {
     sessions[code] = {
       hostId: socket.id,
       guestId: null,
+      hostOnline: true,
+      guestOnline: false,
+      timers: { host: null, guest: null },
     };
 
     socket.join(code);
@@ -63,12 +80,13 @@ io.on("connection", (socket) => {
       return;
     }
 
-    if (session.guestId) {
+    if (session.guestId && session.guestOnline) {
       socket.emit("join-error", "Session is already full.");
       return;
     }
 
     session.guestId = socket.id;
+    session.guestOnline = true;
     socket.join(cleanedCode);
 
     socket.emit("join-success", cleanedCode);
@@ -77,18 +95,79 @@ io.on("connection", (socket) => {
     console.log(`${socket.id} joined session ${cleanedCode}`);
   });
 
-  socket.on("send-message", ({ sessionCode, message }) => {
+  socket.on("rejoin-session", ({ sessionCode, role }) => {
     const cleanedCode = String(sessionCode).trim().toUpperCase();
-    const cleanedMessage = String(message).trim();
     const session = sessions[cleanedCode];
 
     if (!session) {
-      socket.emit("message-error", "Session not found.");
+      socket.emit("rejoin-error", "That channel is no longer available.");
+      return;
+    }
+
+    if (role === "host") {
+      if (session.hostOnline) {
+        socket.emit("rejoin-error", "Host slot already active.");
+        return;
+      }
+      session.hostId = socket.id;
+      session.hostOnline = true;
+      if (session.timers.host) {
+        clearTimeout(session.timers.host);
+        session.timers.host = null;
+      }
+    } else if (role === "guest") {
+      if (session.guestOnline) {
+        socket.emit("rejoin-error", "Guest slot already active.");
+        return;
+      }
+      session.guestId = socket.id;
+      session.guestOnline = true;
+      if (session.timers.guest) {
+        clearTimeout(session.timers.guest);
+        session.timers.guest = null;
+      }
+    } else {
+      socket.emit("rejoin-error", "Invalid role.");
+      return;
+    }
+
+    socket.join(cleanedCode);
+    socket.emit("rejoin-success", {
+      sessionCode: cleanedCode,
+      peerOnline: role === "host" ? session.guestOnline : session.hostOnline,
+    });
+    socket.to(cleanedCode).emit("peer-reconnected");
+
+    console.log(`${socket.id} rejoined session ${cleanedCode} as ${role}`);
+  });
+
+  socket.on("end-session", ({ sessionCode }) => {
+    const cleanedCode = String(sessionCode).trim().toUpperCase();
+    const session = sessions[cleanedCode];
+
+    if (!session) return;
+
+    const belongsToSession =
+      session.hostId === socket.id || session.guestId === socket.id;
+
+    if (!belongsToSession) return;
+
+    endSession(cleanedCode, "closed");
+  });
+
+  socket.on("send-message", ({ sessionCode, message, messageId }, callback) => {
+    const cleanedCode = String(sessionCode).trim().toUpperCase();
+    const cleanedMessage = String(message).trim();
+    const session = sessions[cleanedCode];
+    const ack = typeof callback === "function" ? callback : () => {};
+
+    if (!session) {
+      ack({ ok: false, messageId, error: "Session not found." });
       return;
     }
 
     if (!cleanedMessage) {
-      socket.emit("message-error", "Message cannot be empty.");
+      ack({ ok: false, messageId, error: "Message cannot be empty." });
       return;
     }
 
@@ -96,13 +175,50 @@ io.on("connection", (socket) => {
       session.hostId === socket.id || session.guestId === socket.id;
 
     if (!belongsToSession) {
-      socket.emit("message-error", "You are not part of this session.");
+      ack({ ok: false, messageId, error: "You are not part of this session." });
+      return;
+    }
+
+    const peerOnline =
+      session.hostId === socket.id ? session.guestOnline : session.hostOnline;
+
+    if (!peerOnline) {
+      ack({ ok: false, messageId, error: "Peer is not connected." });
       return;
     }
 
     socket.to(cleanedCode).emit("receive-message", cleanedMessage);
+    ack({ ok: true, messageId });
 
     console.log(`Message sent in ${cleanedCode}: ${cleanedMessage}`);
+  });
+
+  socket.on("typing", ({ sessionCode }) => {
+    const cleanedCode = String(sessionCode).trim().toUpperCase();
+    const session = sessions[cleanedCode];
+
+    if (!session) return;
+
+    const belongsToSession =
+      session.hostId === socket.id || session.guestId === socket.id;
+
+    if (!belongsToSession) return;
+
+    socket.to(cleanedCode).emit("peer-typing");
+  });
+
+  socket.on("stop-typing", ({ sessionCode }) => {
+    const cleanedCode = String(sessionCode).trim().toUpperCase();
+    const session = sessions[cleanedCode];
+
+    if (!session) return;
+
+    const belongsToSession =
+      session.hostId === socket.id || session.guestId === socket.id;
+
+    if (!belongsToSession) return;
+
+    socket.to(cleanedCode).emit("peer-stop-typing");
   });
 
   socket.on("disconnect", () => {
@@ -111,12 +227,30 @@ io.on("connection", (socket) => {
     for (const code of Object.keys(sessions)) {
       const session = sessions[code];
 
-      if (
-        session.hostId === socket.id ||
-        session.guestId === socket.id
-      ) {
-        io.to(code).emit("session-ended");
-        delete sessions[code];
+      if (session.hostId === socket.id && session.hostOnline) {
+        session.hostOnline = false;
+
+        if (!session.guestId) {
+          // No one ever joined — just clean up immediately.
+          endSession(code, "closed");
+          break;
+        }
+
+        socket.to(code).emit("peer-offline");
+        session.timers.host = setTimeout(() => {
+          endSession(code, "timeout");
+        }, RECONNECT_GRACE_MS);
+        break;
+      }
+
+      if (session.guestId === socket.id && session.guestOnline) {
+        session.guestOnline = false;
+
+        socket.to(code).emit("peer-offline");
+        session.timers.guest = setTimeout(() => {
+          endSession(code, "timeout");
+        }, RECONNECT_GRACE_MS);
+        break;
       }
     }
   });
