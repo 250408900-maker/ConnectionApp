@@ -11,10 +11,15 @@ import {
   View,
 } from "react-native";
 
+import * as Clipboard from "expo-clipboard";
 import { io } from "socket.io-client";
 
-const socket = io("http://192.168.1.51:3000", {
+const socket = io("http://192.168.1.54:3000", {
   transports: ["websocket"],
+  reconnection: true,
+  reconnectionAttempts: 15,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 6000,
 });
 
 type MessageStatus = "sending" | "delivered" | "failed";
@@ -38,6 +43,13 @@ type LinkState =
   | "lost"
   | "closed"
   | "error";
+
+type ActivityEntry = {
+  id: string;
+  text: string;
+  time: string;
+  kind: "info" | "good" | "bad";
+};
 
 const STATUS_COPY: Record<LinkState, string> = {
   connecting: "REACHING SERVER",
@@ -65,8 +77,23 @@ const SIGNAL_LEVEL: Record<LinkState, number> = {
   error: 0,
 };
 
+// 🟢 good, 🟡 in-progress, 🔴 bad
+const DOT_COLOR: Record<LinkState, string> = {
+  connecting: "#D9A441",
+  online: "#5DCAA5",
+  opening: "#D9A441",
+  waiting: "#D9A441",
+  tuning: "#D9A441",
+  paired: "#5DCAA5",
+  reconnecting: "#D9A441",
+  lost: "#E0645A",
+  closed: "#E0645A",
+  error: "#E0645A",
+};
+
 const TYPING_TIMEOUT_MS = 1500;
 const SEND_ACK_TIMEOUT_MS = 5000;
+const MAX_LOG_ENTRIES = 60;
 
 const mono = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
 
@@ -76,6 +103,20 @@ function makeMessageId() {
 
 function timeNow() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function timeNowPrecise() {
+  return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatElapsed(totalSeconds: number) {
+  const m = Math.floor(totalSeconds / 60)
+    .toString()
+    .padStart(2, "0");
+  const s = Math.floor(totalSeconds % 60)
+    .toString()
+    .padStart(2, "0");
+  return `${m}:${s}`;
 }
 
 export default function HomeScreen() {
@@ -88,15 +129,51 @@ export default function HomeScreen() {
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
 
+  const [activityLog, setActivityLog] = useState<ActivityEntry[]>([]);
+  const [showLog, setShowLog] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState(false);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
   const scrollViewRef = useRef<ScrollView>(null);
+  const logScrollRef = useRef<ScrollView>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const copyFeedbackTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isTypingRef = useRef(false);
   const roleRef = useRef<"host" | "guest" | null>(null);
   const sessionCodeRef = useRef("");
+  const pairedAtRef = useRef<number | null>(null);
 
   useEffect(() => {
     sessionCodeRef.current = sessionCode;
   }, [sessionCode]);
+
+  function logActivity(text: string, kind: ActivityEntry["kind"] = "info") {
+    setActivityLog((current) => {
+      const next = [
+        ...current,
+        { id: makeMessageId(), text, time: timeNowPrecise(), kind },
+      ];
+      return next.length > MAX_LOG_ENTRIES ? next.slice(next.length - MAX_LOG_ENTRIES) : next;
+    });
+  }
+
+  // Connection timer: counts up while the channel is paired with the peer online.
+  useEffect(() => {
+    if (peerOnline && sessionCode) {
+      if (pairedAtRef.current === null) {
+        pairedAtRef.current = Date.now();
+      }
+      const interval = setInterval(() => {
+        if (pairedAtRef.current) {
+          setElapsedSeconds(Math.floor((Date.now() - pairedAtRef.current) / 1000));
+        }
+      }, 1000);
+      return () => clearInterval(interval);
+    } else {
+      pairedAtRef.current = null;
+      setElapsedSeconds(0);
+    }
+  }, [peerOnline, sessionCode]);
 
   useEffect(() => {
     function resetSessionState() {
@@ -108,6 +185,7 @@ export default function HomeScreen() {
     }
 
     function handleConnect() {
+      logActivity("Connected to server", "good");
       if (sessionCodeRef.current && roleRef.current) {
         setLinkState("reconnecting");
         socket.emit("rejoin-session", {
@@ -120,12 +198,23 @@ export default function HomeScreen() {
     }
 
     function handleDisconnect() {
+      logActivity("Disconnected from server", "bad");
       if (sessionCodeRef.current) {
         setLinkState("lost");
         setPeerOnline(false);
       } else {
         setLinkState("lost");
       }
+    }
+
+    function handleReconnectAttempt(attempt: number) {
+      setLinkState("reconnecting");
+      logActivity(`Reconnect attempt #${attempt}`, "info");
+    }
+
+    function handleReconnectFailed() {
+      setLinkState("error");
+      logActivity("Auto-reconnect gave up — try manually", "bad");
     }
 
     function handleSessionCreated(code: string) {
@@ -135,6 +224,7 @@ export default function HomeScreen() {
       setMessages([]);
       setPeerOnline(false);
       setPeerTyping(false);
+      logActivity(`Channel opened: ${code}`, "good");
     }
 
     function handleJoinSuccess(code: string) {
@@ -143,37 +233,44 @@ export default function HomeScreen() {
       setLinkState("paired");
       setMessages([]);
       setPeerTyping(false);
+      logActivity(`Tuned in to channel ${code}`, "good");
     }
 
     function handleJoinError(errorMessage: string) {
       Alert.alert("Could not tune in", errorMessage);
       setLinkState("error");
+      logActivity(`Join failed: ${errorMessage}`, "bad");
     }
 
     function handleSessionConnected() {
       setLinkState("paired");
       setPeerOnline(true);
+      logActivity("Peer joined the channel", "good");
     }
 
     function handleRejoinSuccess(payload: { sessionCode: string; peerOnline: boolean }) {
       setSessionCode(payload.sessionCode);
       setLinkState("paired");
       setPeerOnline(payload.peerOnline);
+      logActivity("Rejoined channel after reconnect", "good");
     }
 
     function handleRejoinError(errorMessage: string) {
       Alert.alert("Channel expired", errorMessage);
       resetSessionState();
       setLinkState("closed");
+      logActivity(`Rejoin failed: ${errorMessage}`, "bad");
     }
 
     function handlePeerOffline() {
       setPeerOnline(false);
       setPeerTyping(false);
+      logActivity("Peer went offline", "bad");
     }
 
     function handlePeerReconnected() {
       setPeerOnline(true);
+      logActivity("Peer reconnected", "good");
     }
 
     function handleReceiveMessage(receivedMessage: string) {
@@ -191,6 +288,7 @@ export default function HomeScreen() {
     function handleSessionEnded() {
       resetSessionState();
       setLinkState("closed");
+      logActivity("Channel closed", "bad");
       Alert.alert("Channel closed", "The channel is no longer active.");
     }
 
@@ -204,6 +302,8 @@ export default function HomeScreen() {
 
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
+    socket.on("reconnect_attempt", handleReconnectAttempt);
+    socket.on("reconnect_failed", handleReconnectFailed);
     socket.on("session-created", handleSessionCreated);
     socket.on("join-success", handleJoinSuccess);
     socket.on("join-error", handleJoinError);
@@ -224,6 +324,8 @@ export default function HomeScreen() {
     return () => {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
+      socket.off("reconnect_attempt", handleReconnectAttempt);
+      socket.off("reconnect_failed", handleReconnectFailed);
       socket.off("session-created", handleSessionCreated);
       socket.off("join-success", handleJoinSuccess);
       socket.off("join-error", handleJoinError);
@@ -239,6 +341,9 @@ export default function HomeScreen() {
 
       if (typingTimeoutRef.current) {
         clearTimeout(typingTimeoutRef.current);
+      }
+      if (copyFeedbackTimeoutRef.current) {
+        clearTimeout(copyFeedbackTimeoutRef.current);
       }
     };
   }, []);
@@ -270,6 +375,33 @@ export default function HomeScreen() {
         style: "destructive",
         onPress: () => {
           socket.emit("end-session", { sessionCode });
+        },
+      },
+    ]);
+  }
+
+  async function copySessionCode() {
+    if (!sessionCode) return;
+    await Clipboard.setStringAsync(sessionCode);
+    setCopyFeedback(true);
+    logActivity("Channel code copied to clipboard", "info");
+    if (copyFeedbackTimeoutRef.current) {
+      clearTimeout(copyFeedbackTimeoutRef.current);
+    }
+    copyFeedbackTimeoutRef.current = setTimeout(() => setCopyFeedback(false), 1800);
+  }
+
+  function clearChat() {
+    if (messages.length === 0) return;
+
+    Alert.alert("Clear chat?", "This clears messages on this device only.", [
+      { text: "Cancel", style: "cancel" },
+      {
+        text: "Clear",
+        style: "destructive",
+        onPress: () => {
+          setMessages([]);
+          logActivity("Chat cleared", "info");
         },
       },
     ]);
@@ -389,10 +521,44 @@ export default function HomeScreen() {
         <Text style={styles.title}>Field Link</Text>
       </View>
 
-      <View style={styles.statusRow}>
-        <SignalBars level={signalLevel} />
-        <Text style={styles.statusText}>{STATUS_COPY[linkState]}</Text>
-      </View>
+      <Pressable style={styles.statusRow} onPress={() => setShowLog((v) => !v)}>
+        <View style={styles.statusRowLeft}>
+          <View style={[styles.statusDot, { backgroundColor: DOT_COLOR[linkState] }]} />
+          <SignalBars level={signalLevel} />
+          <Text style={styles.statusText}>{STATUS_COPY[linkState]}</Text>
+        </View>
+        <Text style={styles.logToggle}>{showLog ? "HIDE LOG ▲" : "LOG ▼"}</Text>
+      </Pressable>
+
+      {showLog ? (
+        <View style={styles.logPanel}>
+          {activityLog.length === 0 ? (
+            <Text style={styles.logPanelEmpty}>No activity yet.</Text>
+          ) : (
+            <ScrollView
+              ref={logScrollRef}
+              style={styles.logPanelScroll}
+              onContentSizeChange={() => logScrollRef.current?.scrollToEnd({ animated: true })}
+            >
+              {activityLog.map((entry) => (
+                <View key={entry.id} style={styles.logEntryRow}>
+                  <Text
+                    style={[
+                      styles.logEntryDot,
+                      entry.kind === "good" && styles.logEntryDotGood,
+                      entry.kind === "bad" && styles.logEntryDotBad,
+                    ]}
+                  >
+                    ●
+                  </Text>
+                  <Text style={styles.logEntryTime}>{entry.time}</Text>
+                  <Text style={styles.logEntryText}>{entry.text}</Text>
+                </View>
+              ))}
+            </ScrollView>
+          )}
+        </View>
+      ) : null}
 
       {sessionCode === "" ? (
         <View style={styles.lobby}>
@@ -438,8 +604,12 @@ export default function HomeScreen() {
                 <Text style={styles.peerDotLabel}>
                   {peerOnline ? "PEER ONLINE" : "PEER OFFLINE"}
                 </Text>
+                {peerOnline ? (
+                  <Text style={styles.timerText}>· {formatElapsed(elapsedSeconds)}</Text>
+                ) : null}
               </View>
             </View>
+
             <View style={styles.readoutDigits}>
               {sessionCode.split("").map((char, index) => (
                 <View key={`${char}-${index}`} style={styles.digitCell}>
@@ -447,9 +617,20 @@ export default function HomeScreen() {
                 </View>
               ))}
             </View>
-            <Pressable style={styles.endButton} onPress={endChannel}>
-              <Text style={styles.endButtonText}>End Channel</Text>
-            </Pressable>
+
+            <View style={styles.readoutActions}>
+              <Pressable style={styles.copyButton} onPress={copySessionCode}>
+                <Text style={styles.copyButtonText}>
+                  {copyFeedback ? "COPIED ✓" : "COPY CODE"}
+                </Text>
+              </Pressable>
+              <Pressable style={styles.clearButton} onPress={clearChat}>
+                <Text style={styles.clearButtonText}>CLEAR CHAT</Text>
+              </Pressable>
+              <Pressable style={styles.endButton} onPress={endChannel}>
+                <Text style={styles.endButtonText}>END CHANNEL</Text>
+              </Pressable>
+            </View>
           </View>
 
           <ScrollView
@@ -579,19 +760,60 @@ const styles = StyleSheet.create({
   statusRow: {
     flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
     backgroundColor: "#1B2016",
     borderWidth: 1,
     borderColor: "#2B3122",
-    borderRadius: 4,
+    borderRadius: 6,
     paddingVertical: 12,
     paddingHorizontal: 14,
-    marginBottom: 28,
+    marginBottom: 12,
+  },
+  statusRowLeft: { flexDirection: "row", alignItems: "center" },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 10,
   },
   bars: { flexDirection: "row", alignItems: "flex-end", gap: 3, marginRight: 12 },
   bar: { width: 4, borderRadius: 1 },
   statusText: { color: "#B9C0AC", fontSize: 12, fontFamily: mono, letterSpacing: 0.5 },
+  logToggle: { color: "#7C8570", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
+  logPanel: {
+    backgroundColor: "#171B12",
+    borderWidth: 1,
+    borderColor: "#2B3122",
+    borderRadius: 6,
+    marginBottom: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  logPanelEmpty: {
+    color: "#5F6653",
+    fontFamily: mono,
+    fontSize: 12,
+    textAlign: "center",
+    paddingVertical: 8,
+  },
+  logPanelScroll: { maxHeight: 150 },
+  logEntryRow: { flexDirection: "row", alignItems: "center", paddingVertical: 3, gap: 8 },
+  logEntryDot: { color: "#7C8570", fontSize: 8 },
+  logEntryDotGood: { color: "#5DCAA5" },
+  logEntryDotBad: { color: "#E0645A" },
+  logEntryTime: { color: "#5F6653", fontFamily: mono, fontSize: 10, width: 62 },
+  logEntryText: { color: "#B9C0AC", fontFamily: mono, fontSize: 11, flexShrink: 1 },
   lobby: { flex: 1, justifyContent: "center" },
-  primaryButton: { backgroundColor: "#C9A227", paddingVertical: 16, borderRadius: 4 },
+  primaryButton: {
+    backgroundColor: "#C9A227",
+    paddingVertical: 16,
+    borderRadius: 6,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 3,
+  },
   primaryButtonText: {
     color: "#14170F",
     textAlign: "center",
@@ -620,7 +842,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#1B2016",
     borderWidth: 1,
     borderColor: "#2B3122",
-    borderRadius: 4,
+    borderRadius: 6,
     color: "#EDE9DC",
     padding: 16,
     fontSize: 22,
@@ -632,7 +854,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#C9A227",
     paddingVertical: 15,
-    borderRadius: 4,
+    borderRadius: 6,
   },
   secondaryButtonText: {
     color: "#C9A227",
@@ -646,7 +868,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#1B2016",
     borderWidth: 1,
     borderColor: "#2B3122",
-    borderRadius: 4,
+    borderRadius: 6,
     paddingVertical: 14,
     paddingHorizontal: 16,
     alignItems: "center",
@@ -657,38 +879,60 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     width: "100%",
-    marginBottom: 8,
+    marginBottom: 10,
   },
   readoutLabel: { color: "#7C8570", fontSize: 10, fontFamily: mono, letterSpacing: 2 },
   peerDotRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   peerDot: { width: 6, height: 6, borderRadius: 3 },
   peerDotLabel: { color: "#7C8570", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
-  readoutDigits: { flexDirection: "row", gap: 6 },
+  timerText: { color: "#5F6653", fontFamily: mono, fontSize: 10 },
+  readoutDigits: { flexDirection: "row", gap: 6, marginBottom: 14 },
   digitCell: {
     backgroundColor: "#14170F",
     borderWidth: 1,
     borderColor: "#3A4033",
-    borderRadius: 3,
+    borderRadius: 4,
     width: 30,
     paddingVertical: 6,
     alignItems: "center",
   },
   digitText: { color: "#C9A227", fontSize: 18, fontFamily: mono, fontWeight: "700" },
+  readoutActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "center",
+    gap: 8,
+  },
+  copyButton: {
+    borderWidth: 1,
+    borderColor: "#3A4033",
+    borderRadius: 5,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  copyButtonText: { color: "#B9C0AC", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
+  clearButton: {
+    borderWidth: 1,
+    borderColor: "#3A4033",
+    borderRadius: 5,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  clearButtonText: { color: "#B9C0AC", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
   endButton: {
-    marginTop: 12,
     borderWidth: 1,
     borderColor: "#4B2A2A",
-    borderRadius: 4,
+    borderRadius: 5,
     paddingVertical: 8,
-    paddingHorizontal: 14,
+    paddingHorizontal: 12,
   },
-  endButtonText: { color: "#D4877A", fontSize: 11, fontFamily: mono, letterSpacing: 1 },
+  endButtonText: { color: "#D4877A", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
   log: {
     flex: 1,
     backgroundColor: "#1B2016",
     borderWidth: 1,
     borderColor: "#2B3122",
-    borderRadius: 4,
+    borderRadius: 6,
     marginBottom: 12,
   },
   logContent: { padding: 14 },
@@ -728,7 +972,7 @@ const styles = StyleSheet.create({
     backgroundColor: "#1B2016",
     borderWidth: 1,
     borderColor: "#2B3122",
-    borderRadius: 4,
+    borderRadius: 6,
     color: "#EDE9DC",
     padding: 14,
     fontSize: 15,
@@ -736,7 +980,12 @@ const styles = StyleSheet.create({
     marginRight: 8,
   },
   messageInputDisabled: { opacity: 0.5 },
-  sendButton: { backgroundColor: "#C9A227", paddingVertical: 14, paddingHorizontal: 18, borderRadius: 4 },
+  sendButton: {
+    backgroundColor: "#C9A227",
+    paddingVertical: 14,
+    paddingHorizontal: 18,
+    borderRadius: 6,
+  },
   sendButtonDisabled: { backgroundColor: "#4B4326" },
   sendButtonText: { color: "#14170F", fontSize: 13, fontFamily: mono, fontWeight: "700", letterSpacing: 0.5 },
 });
