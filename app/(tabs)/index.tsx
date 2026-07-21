@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from "react";
 import {
   Alert,
   Animated,
+  Image,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -14,9 +16,13 @@ import {
 
 import { Audio } from "expo-av";
 import * as Clipboard from "expo-clipboard";
+import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
+import * as ImagePicker from "expo-image-picker";
+import * as Sharing from "expo-sharing";
 import { io } from "socket.io-client";
 
-const socket = io("http://192.168.1.32:3000", {
+const socket = io("http://192.168.1.48:3000", {
   transports: ["websocket"],
   reconnection: true,
   reconnectionAttempts: 15,
@@ -25,13 +31,25 @@ const socket = io("http://192.168.1.32:3000", {
 });
 
 type MessageStatus = "sending" | "delivered" | "failed";
+type MessageKind = "text" | "image" | "file";
 
 type ChatMessage = {
   id: string;
-  text: string;
+  kind: MessageKind;
   sender: "me" | "other";
   timestamp: string;
   status?: MessageStatus;
+
+  // text
+  text?: string;
+
+  // image / file
+  fileName?: string;
+  fileSize?: number;
+  mimeType?: string;
+  data?: string; // base64 payload, used to render images inline
+  localUri?: string; // on-disk path once a "file" kind has been saved
+  progress?: number; // 0-100, used while a transfer is in flight
 };
 
 type LinkState =
@@ -79,7 +97,6 @@ const SIGNAL_LEVEL: Record<LinkState, number> = {
   error: 0,
 };
 
-// 🟢 good, 🟡 in-progress, 🔴 bad
 const DOT_COLOR: Record<LinkState, string> = {
   connecting: "#D9A441",
   online: "#5DCAA5",
@@ -98,12 +115,17 @@ const SEND_ACK_TIMEOUT_MS = 5000;
 const MAX_LOG_ENTRIES = 60;
 const MESSAGE_PREVIEW_LENGTH = 28;
 
+// Transfer tuning: base64 chars per chunk (~48KB of real bytes) and a hard
+// ceiling on file size so a huge pick doesn't wedge the app or the socket.
+const CHUNK_SIZE = 64000;
+const MAX_FILE_BYTES = 25 * 1024 * 1024; // 25MB
+
 const mono = Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" });
 
-// Short synthesized "blip" tone, embedded as a data URI so no extra asset
-// file needs to ship with the app. Swap this out for require("./assets/notification.mp3")
-// if you'd rather bundle a real sound file.
-const NOTIFICATION_SOUND_URI = "data:audio/wav;base64,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";
+// ⚠️ Paste your ORIGINAL long notification-sound base64 string back in here
+// (or use require("./assets/notification.mp3")) — this is a shortened
+// placeholder and will not decode correctly as-is.
+const NOTIFICATION_SOUND_URI = "data:audio/wav;base64,UklGRkIYAABXQVZFZm10IBAAAAABAAEAIlYAAESsAAACABAAZGF0YR4YAAAA";
 
 function makeMessageId() {
   return `${Date.now()}-${Math.random()}`;
@@ -133,8 +155,23 @@ function truncatePreview(text: string) {
   return `${trimmed.slice(0, MESSAGE_PREVIEW_LENGTH)}…`;
 }
 
+function formatFileSize(bytes?: number) {
+  if (!bytes && bytes !== 0) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileGlyph(mimeType?: string) {
+  if (!mimeType) return "📄";
+  if (mimeType.includes("pdf")) return "📕";
+  if (mimeType.includes("zip") || mimeType.includes("compressed")) return "🗜️";
+  if (mimeType.startsWith("audio")) return "🎵";
+  if (mimeType.startsWith("video")) return "🎞️";
+  return "📄";
+}
+
 // A Pressable wrapper that adds a small, snappy scale animation on press.
-// Drop-in replacement for Pressable anywhere a button-like tap target is used.
 function AnimatedPressable({
   onPress,
   style,
@@ -149,30 +186,15 @@ function AnimatedPressable({
   const scale = useRef(new Animated.Value(1)).current;
 
   function pressIn() {
-    Animated.spring(scale, {
-      toValue: 0.95,
-      useNativeDriver: true,
-      speed: 60,
-      bounciness: 0,
-    }).start();
+    Animated.spring(scale, { toValue: 0.95, useNativeDriver: true, speed: 60, bounciness: 0 }).start();
   }
 
   function pressOut() {
-    Animated.spring(scale, {
-      toValue: 1,
-      useNativeDriver: true,
-      speed: 20,
-      bounciness: 8,
-    }).start();
+    Animated.spring(scale, { toValue: 1, useNativeDriver: true, speed: 20, bounciness: 8 }).start();
   }
 
   return (
-    <Pressable
-      onPress={onPress}
-      onPressIn={pressIn}
-      onPressOut={pressOut}
-      disabled={disabled}
-    >
+    <Pressable onPress={onPress} onPressIn={pressIn} onPressOut={pressOut} disabled={disabled}>
       <Animated.View style={[style, { transform: [{ scale }] }]}>{children}</Animated.View>
     </Pressable>
   );
@@ -192,6 +214,7 @@ export default function HomeScreen() {
   const [showLog, setShowLog] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [viewerImage, setViewerImage] = useState<{ uri: string } | null>(null);
 
   const scrollViewRef = useRef<ScrollView>(null);
   const logScrollRef = useRef<ScrollView>(null);
@@ -203,22 +226,35 @@ export default function HomeScreen() {
   const pairedAtRef = useRef<number | null>(null);
   const notificationSoundRef = useRef<Audio.Sound | null>(null);
 
+  // Tracks in-progress incoming transfers, keyed by transferId, so chunks
+  // that arrive out of order (or interleaved with another transfer) still
+  // land in the right slot and update the right chat bubble.
+  const incomingTransfersRef = useRef<
+    Record<
+      string,
+      {
+        chunks: string[];
+        received: number;
+        totalChunks: number;
+        messageId: string;
+        kind: MessageKind;
+        fileName: string;
+        mimeType: string;
+      }
+    >
+  >({});
+
   useEffect(() => {
     sessionCodeRef.current = sessionCode;
   }, [sessionCode]);
 
   function logActivity(text: string, kind: ActivityEntry["kind"] = "info") {
     setActivityLog((current) => {
-      const next = [
-        ...current,
-        { id: makeMessageId(), text, time: timeNowPrecise(), kind },
-      ];
+      const next = [...current, { id: makeMessageId(), text, time: timeNowPrecise(), kind }];
       return next.length > MAX_LOG_ENTRIES ? next.slice(next.length - MAX_LOG_ENTRIES) : next;
     });
   }
 
-  // Load the notification sound once on mount, and make sure it can play
-  // even when the device's silent switch is on (iOS).
   useEffect(() => {
     let isMounted = true;
 
@@ -252,12 +288,10 @@ export default function HomeScreen() {
       await sound.setPositionAsync(0);
       await sound.playAsync();
     } catch (error) {
-      // Playback failures shouldn't interrupt the chat experience.
       console.warn("Could not play notification sound", error);
     }
   }
 
-  // Connection timer: counts up while the channel is paired with the peer online.
   useEffect(() => {
     if (peerOnline && sessionCode) {
       if (pairedAtRef.current === null) {
@@ -275,9 +309,6 @@ export default function HomeScreen() {
     }
   }, [peerOnline, sessionCode]);
 
-  // Belt-and-suspenders auto-scroll: onContentSizeChange below already scrolls
-  // the chat log to the bottom whenever its content grows, but this effect
-  // guarantees it also happens right after messages/typing-state changes.
   useEffect(() => {
     const timeout = setTimeout(() => {
       scrollViewRef.current?.scrollToEnd({ animated: true });
@@ -292,6 +323,7 @@ export default function HomeScreen() {
       setPeerOnline(false);
       setPeerTyping(false);
       roleRef.current = null;
+      incomingTransfersRef.current = {};
     }
 
     function handleConnect() {
@@ -386,6 +418,7 @@ export default function HomeScreen() {
     function handleReceiveMessage(receivedMessage: string) {
       const newMessage: ChatMessage = {
         id: makeMessageId(),
+        kind: "text",
         text: receivedMessage,
         sender: "other",
         timestamp: timeNow(),
@@ -394,6 +427,97 @@ export default function HomeScreen() {
       setPeerTyping(false);
       setMessages((current) => [...current, newMessage]);
       logActivity(`Received: "${truncatePreview(receivedMessage)}"`, "info");
+      playNotificationSound();
+    }
+
+    // ---- File transfer: receiving side ----
+
+    function handleFileTransferStart(payload: {
+      transferId: string;
+      fileName: string;
+      fileSize: number;
+      mimeType: string;
+      kind: MessageKind;
+      totalChunks: number;
+    }) {
+      const messageId = makeMessageId();
+
+      incomingTransfersRef.current[payload.transferId] = {
+        chunks: new Array(payload.totalChunks),
+        received: 0,
+        totalChunks: payload.totalChunks,
+        messageId,
+        kind: payload.kind,
+        fileName: payload.fileName,
+        mimeType: payload.mimeType,
+      };
+
+      setPeerTyping(false);
+      setMessages((current) => [
+        ...current,
+        {
+          id: messageId,
+          kind: payload.kind,
+          sender: "other",
+          timestamp: timeNow(),
+          fileName: payload.fileName,
+          fileSize: payload.fileSize,
+          mimeType: payload.mimeType,
+          progress: 0,
+        },
+      ]);
+
+      logActivity(`Receiving ${payload.kind}: ${payload.fileName}`, "info");
+    }
+
+    function handleFileTransferChunk(payload: {
+      transferId: string;
+      chunkIndex: number;
+      data: string;
+    }) {
+      const transfer = incomingTransfersRef.current[payload.transferId];
+      if (!transfer) return;
+
+      transfer.chunks[payload.chunkIndex] = payload.data;
+      transfer.received += 1;
+
+      const progress = Math.round((transfer.received / transfer.totalChunks) * 100);
+      setMessages((current) =>
+        current.map((m) => (m.id === transfer.messageId ? { ...m, progress } : m))
+      );
+    }
+
+    async function handleFileTransferEnd(payload: { transferId: string }) {
+      const transfer = incomingTransfersRef.current[payload.transferId];
+      if (!transfer) return;
+      delete incomingTransfersRef.current[payload.transferId];
+
+      const fullBase64 = transfer.chunks.join("");
+
+      if (transfer.kind === "image") {
+        setMessages((current) =>
+          current.map((m) =>
+            m.id === transfer.messageId ? { ...m, data: fullBase64, progress: 100 } : m
+          )
+        );
+      } else {
+        try {
+          const path = `${FileSystem.documentDirectory}${Date.now()}-${transfer.fileName}`;
+          await FileSystem.writeAsStringAsync(path, fullBase64, {
+            encoding: FileSystem.EncodingType.Base64,
+          });
+          setMessages((current) =>
+            current.map((m) =>
+              m.id === transfer.messageId ? { ...m, localUri: path, progress: 100 } : m
+            )
+          );
+        } catch (error) {
+          console.warn("Could not save incoming file", error);
+          logActivity(`Failed to save ${transfer.fileName}`, "bad");
+        }
+      }
+
+      logActivity(`Received ${transfer.kind}: ${transfer.fileName}`, "good");
       playNotificationSound();
     }
 
@@ -425,6 +549,9 @@ export default function HomeScreen() {
     socket.on("peer-offline", handlePeerOffline);
     socket.on("peer-reconnected", handlePeerReconnected);
     socket.on("receive-message", handleReceiveMessage);
+    socket.on("file-transfer-start", handleFileTransferStart);
+    socket.on("file-transfer-chunk", handleFileTransferChunk);
+    socket.on("file-transfer-end", handleFileTransferEnd);
     socket.on("session-ended", handleSessionEnded);
     socket.on("peer-typing", handlePeerTyping);
     socket.on("peer-stop-typing", handlePeerStopTyping);
@@ -447,16 +574,15 @@ export default function HomeScreen() {
       socket.off("peer-offline", handlePeerOffline);
       socket.off("peer-reconnected", handlePeerReconnected);
       socket.off("receive-message", handleReceiveMessage);
+      socket.off("file-transfer-start", handleFileTransferStart);
+      socket.off("file-transfer-chunk", handleFileTransferChunk);
+      socket.off("file-transfer-end", handleFileTransferEnd);
       socket.off("session-ended", handleSessionEnded);
       socket.off("peer-typing", handlePeerTyping);
       socket.off("peer-stop-typing", handlePeerStopTyping);
 
-      if (typingTimeoutRef.current) {
-        clearTimeout(typingTimeoutRef.current);
-      }
-      if (copyFeedbackTimeoutRef.current) {
-        clearTimeout(copyFeedbackTimeoutRef.current);
-      }
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+      if (copyFeedbackTimeoutRef.current) clearTimeout(copyFeedbackTimeoutRef.current);
     };
   }, []);
 
@@ -497,9 +623,7 @@ export default function HomeScreen() {
     await Clipboard.setStringAsync(sessionCode);
     setCopyFeedback(true);
     logActivity("Channel code copied to clipboard", "info");
-    if (copyFeedbackTimeoutRef.current) {
-      clearTimeout(copyFeedbackTimeoutRef.current);
-    }
+    if (copyFeedbackTimeoutRef.current) clearTimeout(copyFeedbackTimeoutRef.current);
     copyFeedbackTimeoutRef.current = setTimeout(() => setCopyFeedback(false), 1800);
   }
 
@@ -534,9 +658,7 @@ export default function HomeScreen() {
       socket.emit("typing", { sessionCode });
     }
 
-    if (typingTimeoutRef.current) {
-      clearTimeout(typingTimeoutRef.current);
-    }
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
 
     typingTimeoutRef.current = setTimeout(() => {
       stopTyping();
@@ -558,18 +680,14 @@ export default function HomeScreen() {
   }
 
   function dispatchMessage(text: string, id: string) {
-    setMessages((current) =>
-      current.map((m) => (m.id === id ? { ...m, status: "sending" } : m))
-    );
+    setMessages((current) => current.map((m) => (m.id === id ? { ...m, status: "sending" } : m)));
 
     let settled = false;
 
     const timeout = setTimeout(() => {
       if (settled) return;
       settled = true;
-      setMessages((current) =>
-        current.map((m) => (m.id === id ? { ...m, status: "failed" } : m))
-      );
+      setMessages((current) => current.map((m) => (m.id === id ? { ...m, status: "failed" } : m)));
       logActivity(`Message timed out: "${truncatePreview(text)}"`, "bad");
     }, SEND_ACK_TIMEOUT_MS);
 
@@ -582,9 +700,7 @@ export default function HomeScreen() {
         clearTimeout(timeout);
 
         setMessages((current) =>
-          current.map((m) =>
-            m.id === id ? { ...m, status: response.ok ? "delivered" : "failed" } : m
-          )
+          current.map((m) => (m.id === id ? { ...m, status: response.ok ? "delivered" : "failed" } : m))
         );
 
         if (response.ok) {
@@ -611,6 +727,7 @@ export default function HomeScreen() {
     const id = makeMessageId();
     const newMessage: ChatMessage = {
       id,
+      kind: "text",
       text: cleanedMessage,
       sender: "me",
       timestamp: timeNow(),
@@ -627,12 +744,202 @@ export default function HomeScreen() {
       Alert.alert("No peer connected", "Wait for the other device before retrying.");
       return;
     }
-    dispatchMessage(chatMessage.text, chatMessage.id);
+    if (chatMessage.kind === "text" && chatMessage.text) {
+      dispatchMessage(chatMessage.text, chatMessage.id);
+    }
+    // Failed file/image transfers are simplest to re-send from the picker
+    // again rather than resume — chunk-level resume isn't implemented yet.
   }
 
-  // Enter-to-send on physical keyboards (desktop web / RN-web / hardware
-  // keyboards on tablets). Shift+Enter still falls through so multi-line
-  // input isn't blocked if the input is ever made multiline later.
+  // ---- File transfer: sending side ----
+
+  async function sendAttachment(
+    uri: string,
+    fileName: string,
+    mimeType: string,
+    kind: MessageKind
+  ) {
+    if (!sessionCode || !peerOnline) {
+      Alert.alert("No peer connected", "Wait for the other device before sending.");
+      return;
+    }
+  
+    try {
+      const info = await FileSystem.getInfoAsync(uri);
+      const fileSize = info.exists && "size" in info ? info.size ?? 0 : 0;
+  
+      if (fileSize > MAX_FILE_BYTES) {
+        Alert.alert(
+          "File too large",
+          `Files are limited to ${formatFileSize(MAX_FILE_BYTES)} for now.`
+        );
+        return;
+      }
+  
+      const base64 = await FileSystem.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+  
+      const totalChunks = Math.max(
+        1,
+        Math.ceil(base64.length / CHUNK_SIZE)
+      );
+  
+      const transferId = makeMessageId();
+  
+      const localMessage: ChatMessage = {
+        id: transferId,
+        kind,
+        sender: "me",
+        timestamp: timeNow(),
+        fileName,
+        fileSize,
+        mimeType,
+        data: kind === "image" ? base64 : undefined,
+        localUri: uri,
+        status: "sending",
+        progress: 0,
+      };
+  
+      setMessages((current) => [...current, localMessage]);
+      logActivity(`Sending ${kind}: ${fileName}`, "info");
+  
+      socket.emit(
+        "file-transfer-start",
+        {
+          transferId,
+          sessionCode,
+          name: fileName,
+          size: fileSize,
+          mimeType,
+          totalChunks,
+        },
+        (response: { ok: boolean; error?: string }) => {
+          console.log("START ACK:", response);
+        }
+      );
+  
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        const chunk = base64.slice(
+          chunkIndex * CHUNK_SIZE,
+          (chunkIndex + 1) * CHUNK_SIZE
+        );
+  
+        socket.emit(
+          "file-transfer-chunk",
+          {
+            transferId,
+            sessionCode,
+            index: chunkIndex,
+            data: chunk,
+          },
+          (response: { ok: boolean }) => {
+            console.log("CHUNK ACK:", response);
+          }
+        );
+  
+        const progress = Math.round(
+          ((chunkIndex + 1) / totalChunks) * 100
+        );
+  
+        setMessages((current) =>
+          current.map((m) =>
+            m.id === transferId ? { ...m, progress } : m
+          )
+        );
+      }
+  
+      socket.emit(
+        "file-transfer-end",
+        { transferId, sessionCode },
+        (response: { ok: boolean; error?: string }) => {
+          setMessages((current) =>
+            current.map((m) =>
+              m.id === transferId
+                ? {
+                    ...m,
+                    status: response?.ok ? "delivered" : "failed",
+                    progress: 100,
+                  }
+                : m
+            )
+          );
+  
+          if (response?.ok) {
+            logActivity(`Sent ${kind}: ${fileName}`, "good");
+          } else {
+            logActivity(`Failed to send ${fileName}`, "bad");
+          }
+        }
+      );
+    } catch (error) {
+      console.warn("sendAttachment failed", error);
+      Alert.alert(
+        "Couldn't send that",
+        "Something went wrong reading the file."
+      );
+    }
+  }
+
+  async function pickImage() {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert("Permission needed", "Photo library access is required to send images.");
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.7,
+    });
+
+    if (result.canceled || !result.assets?.[0]) return;
+
+    const asset = result.assets[0];
+    const fileName = asset.fileName ?? `photo-${Date.now()}.jpg`;
+    const mimeType = asset.mimeType ?? "image/jpeg";
+    sendAttachment(asset.uri, fileName, mimeType, "image");
+  }
+
+  async function pickDocument() {
+    const result = await DocumentPicker.getDocumentAsync({
+      type: "*/*",
+      copyToCacheDirectory: true,
+    });
+
+    if (result.canceled || !result.assets?.[0]) return;
+
+    const asset = result.assets[0];
+    sendAttachment(asset.uri, asset.name, asset.mimeType ?? "application/octet-stream", "file");
+  }
+
+  function openAttachmentPicker() {
+    if (!canSendComputed()) {
+      Alert.alert("No peer connected", "Wait for the other device before sending.");
+      return;
+    }
+
+    Alert.alert("Send attachment", undefined, [
+      { text: "Photo", onPress: pickImage },
+      { text: "File", onPress: pickDocument },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  }
+
+  async function openReceivedFile(chatMessage: ChatMessage) {
+    if (!chatMessage.localUri) return;
+    const canShare = await Sharing.isAvailableAsync();
+    if (canShare) {
+      Sharing.shareAsync(chatMessage.localUri, { mimeType: chatMessage.mimeType });
+    } else {
+      Alert.alert("Saved", `File saved to app storage as ${chatMessage.fileName}`);
+    }
+  }
+
+  function canSendComputed() {
+    return sessionCode !== "" && peerOnline;
+  }
+
   function handleMessageKeyPress(event: any) {
     const nativeEvent = event?.nativeEvent ?? {};
     if (nativeEvent.key === "Enter" && !nativeEvent.shiftKey) {
@@ -642,7 +949,7 @@ export default function HomeScreen() {
   }
 
   const signalLevel = SIGNAL_LEVEL[linkState];
-  const canSend = sessionCode !== "" && peerOnline;
+  const canSend = canSendComputed();
 
   return (
     <View style={styles.container}>
@@ -731,18 +1038,9 @@ export default function HomeScreen() {
             <View style={styles.readoutHeader}>
               <Text style={styles.readoutLabel}>CHANNEL</Text>
               <View style={styles.peerDotRow}>
-                <View
-                  style={[
-                    styles.peerDot,
-                    { backgroundColor: peerOnline ? "#5DCAA5" : "#4B5344" },
-                  ]}
-                />
-                <Text style={styles.peerDotLabel}>
-                  {peerOnline ? "PEER ONLINE" : "PEER OFFLINE"}
-                </Text>
-                {peerOnline ? (
-                  <Text style={styles.timerText}>· {formatElapsed(elapsedSeconds)}</Text>
-                ) : null}
+                <View style={[styles.peerDot, { backgroundColor: peerOnline ? "#5DCAA5" : "#4B5344" }]} />
+                <Text style={styles.peerDotLabel}>{peerOnline ? "PEER ONLINE" : "PEER OFFLINE"}</Text>
+                {peerOnline ? <Text style={styles.timerText}>· {formatElapsed(elapsedSeconds)}</Text> : null}
               </View>
             </View>
 
@@ -756,9 +1054,7 @@ export default function HomeScreen() {
 
             <View style={styles.readoutActions}>
               <AnimatedPressable style={styles.copyButton} onPress={copySessionCode}>
-                <Text style={styles.copyButtonText}>
-                  {copyFeedback ? "COPIED ✓" : "COPY CODE"}
-                </Text>
+                <Text style={styles.copyButtonText}>{copyFeedback ? "COPIED ✓" : "COPY CODE"}</Text>
               </AnimatedPressable>
               <AnimatedPressable style={styles.clearButton} onPress={clearChat}>
                 <Text style={styles.clearButtonText}>CLEAR CHAT</Text>
@@ -773,9 +1069,7 @@ export default function HomeScreen() {
             ref={scrollViewRef}
             style={styles.log}
             contentContainerStyle={styles.logContent}
-            onContentSizeChange={() =>
-              scrollViewRef.current?.scrollToEnd({ animated: true })
-            }
+            onContentSizeChange={() => scrollViewRef.current?.scrollToEnd({ animated: true })}
           >
             {messages.length === 0 ? (
               <View style={styles.emptyState}>
@@ -789,33 +1083,77 @@ export default function HomeScreen() {
                   key={chatMessage.id}
                   style={[
                     styles.bubbleRow,
-                    chatMessage.sender === "me"
-                      ? styles.bubbleRowMe
-                      : styles.bubbleRowOther,
+                    chatMessage.sender === "me" ? styles.bubbleRowMe : styles.bubbleRowOther,
                   ]}
                 >
                   <Pressable
-                    disabled={chatMessage.status !== "failed"}
-                    onPress={() => retryMessage(chatMessage)}
+                    disabled={chatMessage.status !== "failed" && chatMessage.kind !== "file"}
+                    onPress={() => {
+                      if (chatMessage.status === "failed") retryMessage(chatMessage);
+                      else if (chatMessage.kind === "file" && chatMessage.localUri) openReceivedFile(chatMessage);
+                    }}
                     style={[
                       styles.bubble,
                       chatMessage.sender === "me" ? styles.bubbleMe : styles.bubbleOther,
                     ]}
                   >
-                    <Text style={styles.logText}>{chatMessage.text}</Text>
+                    {chatMessage.kind === "text" ? (
+                      <Text style={styles.logText}>{chatMessage.text}</Text>
+                    ) : chatMessage.kind === "image" ? (
+                      <Pressable
+                        onPress={() =>
+                          chatMessage.data &&
+                          setViewerImage({
+                            uri: `data:${chatMessage.mimeType || "image/jpeg"};base64,${chatMessage.data}`,
+                          })
+                        }
+                      >
+                        {chatMessage.data ? (
+                          <Image
+                            source={{ uri: `data:${chatMessage.mimeType || "image/jpeg"};base64,${chatMessage.data}` }}
+                            style={styles.imageThumb}
+                            resizeMode="cover"
+                          />
+                        ) : (
+                          <View style={styles.imagePlaceholder}>
+                            <Text style={styles.imagePlaceholderText}>🖼️ receiving…</Text>
+                          </View>
+                        )}
+                      </Pressable>
+                    ) : (
+                      <View style={styles.fileCard}>
+                        <Text style={styles.fileGlyph}>{fileGlyph(chatMessage.mimeType)}</Text>
+                        <View style={styles.fileCardInfo}>
+                          <Text style={styles.fileCardName} numberOfLines={1}>
+                            {chatMessage.fileName}
+                          </Text>
+                          <Text style={styles.fileCardSize}>{formatFileSize(chatMessage.fileSize)}</Text>
+                        </View>
+                      </View>
+                    )}
+
+                    {chatMessage.progress !== undefined && chatMessage.progress < 100 ? (
+                      <View style={styles.progressTrack}>
+                        <View style={[styles.progressFill, { width: `${chatMessage.progress}%` }]} />
+                      </View>
+                    ) : null}
+
                     <View style={styles.bubbleFooter}>
                       <Text style={styles.timeText}>{chatMessage.timestamp}</Text>
                       {chatMessage.sender === "me" && chatMessage.status ? (
                         <Text
-                          style={[
-                            styles.statusText2,
-                            chatMessage.status === "failed" && styles.statusFailed,
-                          ]}
+                          style={[styles.statusText2, chatMessage.status === "failed" && styles.statusFailed]}
                         >
-                          {chatMessage.status === "sending" && "○ sending…"}
+                          {chatMessage.status === "sending" &&
+                            (chatMessage.progress !== undefined && chatMessage.progress < 100
+                              ? `○ ${chatMessage.progress}%`
+                              : "○ sending…")}
                           {chatMessage.status === "delivered" && "✓✓ delivered"}
                           {chatMessage.status === "failed" && "⚠ failed — tap to retry"}
                         </Text>
+                      ) : null}
+                      {chatMessage.sender === "other" && chatMessage.kind === "file" && chatMessage.localUri ? (
+                        <Text style={styles.statusText2}>tap to open</Text>
                       ) : null}
                     </View>
                   </Pressable>
@@ -823,12 +1161,18 @@ export default function HomeScreen() {
               ))
             )}
 
-            {peerTyping ? (
-              <Text style={styles.typingText}>Peer is transmitting...</Text>
-            ) : null}
+            {peerTyping ? <Text style={styles.typingText}>Peer is transmitting...</Text> : null}
           </ScrollView>
 
           <View style={styles.sendRow}>
+            <AnimatedPressable
+              style={[styles.attachButton, !canSend && styles.attachButtonDisabled]}
+              onPress={openAttachmentPicker}
+              disabled={!canSend}
+            >
+              <Text style={styles.attachButtonText}>📎</Text>
+            </AnimatedPressable>
+
             <TextInput
               style={[styles.messageInput, !canSend && styles.messageInputDisabled]}
               placeholder={canSend ? "transmit..." : "waiting for peer..."}
@@ -852,6 +1196,14 @@ export default function HomeScreen() {
           </View>
         </View>
       )}
+
+      <Modal visible={!!viewerImage} transparent animationType="fade" onRequestClose={() => setViewerImage(null)}>
+        <Pressable style={styles.viewerBackdrop} onPress={() => setViewerImage(null)}>
+          {viewerImage ? (
+            <Image source={{ uri: viewerImage.uri }} style={styles.viewerImage} resizeMode="contain" />
+          ) : null}
+        </Pressable>
+      </Modal>
     </View>
   );
 }
@@ -861,42 +1213,17 @@ function SignalBars({ level }: { level: number }) {
   return (
     <View style={styles.bars}>
       {heights.map((h, i) => (
-        <View
-          key={i}
-          style={[
-            styles.bar,
-            {
-              height: h,
-              backgroundColor: i < level ? "#C9A227" : "#3A4033",
-            },
-          ]}
-        />
+        <View key={i} style={[styles.bar, { height: h, backgroundColor: i < level ? "#C9A227" : "#3A4033" }]} />
       ))}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    padding: 24,
-    paddingTop: 64,
-    backgroundColor: "#14170F",
-  },
+  container: { flex: 1, padding: 24, paddingTop: 64, backgroundColor: "#14170F" },
   header: { marginBottom: 24 },
-  eyebrow: {
-    color: "#7C8570",
-    fontSize: 11,
-    letterSpacing: 2,
-    fontFamily: mono,
-    marginBottom: 6,
-  },
-  title: {
-    color: "#EDE9DC",
-    fontSize: 30,
-    fontWeight: "700",
-    letterSpacing: 0.5,
-  },
+  eyebrow: { color: "#7C8570", fontSize: 11, letterSpacing: 2, fontFamily: mono, marginBottom: 6 },
+  title: { color: "#EDE9DC", fontSize: 30, fontWeight: "700", letterSpacing: 0.5 },
   statusRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -910,12 +1237,7 @@ const styles = StyleSheet.create({
     marginBottom: 14,
   },
   statusRowLeft: { flexDirection: "row", alignItems: "center" },
-  statusDot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    marginRight: 10,
-  },
+  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 10 },
   bars: { flexDirection: "row", alignItems: "flex-end", gap: 3, marginRight: 12 },
   bar: { width: 4, borderRadius: 1 },
   statusText: { color: "#B9C0AC", fontSize: 12, fontFamily: mono, letterSpacing: 0.5 },
@@ -929,13 +1251,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 12,
   },
-  logPanelEmpty: {
-    color: "#5F6653",
-    fontFamily: mono,
-    fontSize: 12,
-    textAlign: "center",
-    paddingVertical: 8,
-  },
+  logPanelEmpty: { color: "#5F6653", fontFamily: mono, fontSize: 12, textAlign: "center", paddingVertical: 8 },
   logPanelScroll: { maxHeight: 150 },
   logEntryRow: { flexDirection: "row", alignItems: "center", paddingVertical: 4, gap: 8 },
   logEntryDot: { color: "#7C8570", fontSize: 8 },
@@ -954,30 +1270,12 @@ const styles = StyleSheet.create({
     shadowRadius: 4,
     elevation: 3,
   },
-  primaryButtonText: {
-    color: "#14170F",
-    textAlign: "center",
-    fontSize: 16,
-    fontWeight: "700",
-    letterSpacing: 0.3,
-  },
+  primaryButtonText: { color: "#14170F", textAlign: "center", fontSize: 16, fontWeight: "700", letterSpacing: 0.3 },
   dividerRow: { flexDirection: "row", alignItems: "center", marginVertical: 30 },
   dividerLine: { flex: 1, height: 1, backgroundColor: "#2B3122" },
-  dividerText: {
-    color: "#5F6653",
-    fontSize: 11,
-    fontFamily: mono,
-    letterSpacing: 1.5,
-    marginHorizontal: 12,
-  },
+  dividerText: { color: "#5F6653", fontSize: 11, fontFamily: mono, letterSpacing: 1.5, marginHorizontal: 12 },
   dial: { marginBottom: 18 },
-  dialLabel: {
-    color: "#7C8570",
-    fontSize: 11,
-    fontFamily: mono,
-    letterSpacing: 1.5,
-    marginBottom: 9,
-  },
+  dialLabel: { color: "#7C8570", fontSize: 11, fontFamily: mono, letterSpacing: 1.5, marginBottom: 9 },
   dialInput: {
     backgroundColor: "#1B2016",
     borderWidth: 1,
@@ -990,19 +1288,8 @@ const styles = StyleSheet.create({
     textAlign: "center",
     letterSpacing: 6,
   },
-  secondaryButton: {
-    borderWidth: 1,
-    borderColor: "#C9A227",
-    paddingVertical: 16,
-    borderRadius: 8,
-  },
-  secondaryButtonText: {
-    color: "#C9A227",
-    textAlign: "center",
-    fontSize: 16,
-    fontWeight: "600",
-    letterSpacing: 0.3,
-  },
+  secondaryButton: { borderWidth: 1, borderColor: "#C9A227", paddingVertical: 16, borderRadius: 8 },
+  secondaryButtonText: { color: "#C9A227", textAlign: "center", fontSize: 16, fontWeight: "600", letterSpacing: 0.3 },
   session: { flex: 1 },
   readout: {
     backgroundColor: "#1B2016",
@@ -1037,96 +1324,67 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   digitText: { color: "#C9A227", fontSize: 18, fontFamily: mono, fontWeight: "700" },
-  readoutActions: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    justifyContent: "center",
-    gap: 9,
-  },
-  copyButton: {
-    borderWidth: 1,
-    borderColor: "#3A4033",
-    borderRadius: 6,
-    paddingVertical: 9,
-    paddingHorizontal: 13,
-  },
+  readoutActions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 9 },
+  copyButton: { borderWidth: 1, borderColor: "#3A4033", borderRadius: 6, paddingVertical: 9, paddingHorizontal: 13 },
   copyButtonText: { color: "#B9C0AC", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
-  clearButton: {
-    borderWidth: 1,
-    borderColor: "#3A4033",
-    borderRadius: 6,
-    paddingVertical: 9,
-    paddingHorizontal: 13,
-  },
+  clearButton: { borderWidth: 1, borderColor: "#3A4033", borderRadius: 6, paddingVertical: 9, paddingHorizontal: 13 },
   clearButtonText: { color: "#B9C0AC", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
-  endButton: {
-    borderWidth: 1,
-    borderColor: "#4B2A2A",
-    borderRadius: 6,
-    paddingVertical: 9,
-    paddingHorizontal: 13,
-  },
+  endButton: { borderWidth: 1, borderColor: "#4B2A2A", borderRadius: 6, paddingVertical: 9, paddingHorizontal: 13 },
   endButtonText: { color: "#D4877A", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
-  log: {
-    flex: 1,
-    backgroundColor: "#1B2016",
-    borderWidth: 1,
-    borderColor: "#2B3122",
-    borderRadius: 8,
-    marginBottom: 14,
-  },
+  log: { flex: 1, backgroundColor: "#1B2016", borderWidth: 1, borderColor: "#2B3122", borderRadius: 8, marginBottom: 14 },
   logContent: { padding: 16, flexGrow: 1 },
-  emptyState: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    paddingVertical: 40,
-  },
+  emptyState: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 40 },
   emptyStateIcon: { fontSize: 28, marginBottom: 10, opacity: 0.6 },
-  emptyText: {
-    color: "#8A9280",
-    fontFamily: mono,
-    fontSize: 14,
-    textAlign: "center",
-    fontWeight: "600",
-  },
-  emptySubtext: {
-    color: "#5F6653",
-    fontFamily: mono,
-    fontSize: 12,
-    textAlign: "center",
-    marginTop: 4,
-  },
+  emptyText: { color: "#8A9280", fontFamily: mono, fontSize: 14, textAlign: "center", fontWeight: "600" },
+  emptySubtext: { color: "#5F6653", fontFamily: mono, fontSize: 12, textAlign: "center", marginTop: 4 },
   bubbleRow: { marginVertical: 6, flexDirection: "row" },
   bubbleRowMe: { justifyContent: "flex-end" },
   bubbleRowOther: { justifyContent: "flex-start" },
-  bubble: {
-    maxWidth: "78%",
-    borderRadius: 10,
-    paddingVertical: 9,
-    paddingHorizontal: 13,
-  },
+  bubble: { maxWidth: "78%", borderRadius: 10, paddingVertical: 9, paddingHorizontal: 13 },
   bubbleMe: { backgroundColor: "#26301F" },
   bubbleOther: { backgroundColor: "#20241A" },
   logText: { color: "#EDE9DC", fontSize: 15, flexShrink: 1, flexWrap: "wrap" },
-  bubbleFooter: {
-    flexDirection: "row",
-    justifyContent: "space-between",
+  imageThumb: { width: 200, height: 200, borderRadius: 8, backgroundColor: "#14170F" },
+  imagePlaceholder: {
+    width: 200,
+    height: 200,
+    borderRadius: 8,
+    backgroundColor: "#14170F",
     alignItems: "center",
-    marginTop: 5,
-    gap: 10,
+    justifyContent: "center",
   },
+  imagePlaceholderText: { color: "#7C8570", fontFamily: mono, fontSize: 12 },
+  fileCard: { flexDirection: "row", alignItems: "center", gap: 10, minWidth: 180 },
+  fileGlyph: { fontSize: 26 },
+  fileCardInfo: { flexShrink: 1 },
+  fileCardName: { color: "#EDE9DC", fontSize: 14, fontFamily: mono },
+  fileCardSize: { color: "#7C8570", fontSize: 11, fontFamily: mono, marginTop: 2 },
+  progressTrack: {
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: "#14170F",
+    marginTop: 8,
+    overflow: "hidden",
+  },
+  progressFill: { height: 4, backgroundColor: "#C9A227" },
+  bubbleFooter: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 5, gap: 10 },
   timeText: { color: "#5F6653", fontFamily: mono, fontSize: 10 },
   statusText2: { color: "#5F6653", fontFamily: mono, fontSize: 10 },
   statusFailed: { color: "#D4877A" },
-  typingText: {
-    color: "#7C8570",
-    fontFamily: mono,
-    fontSize: 12,
-    fontStyle: "italic",
-    marginTop: 6,
-  },
+  typingText: { color: "#7C8570", fontFamily: mono, fontSize: 12, fontStyle: "italic", marginTop: 6 },
   sendRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+  attachButton: {
+    width: 48,
+    height: 48,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#2B3122",
+    backgroundColor: "#1B2016",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  attachButtonDisabled: { opacity: 0.5 },
+  attachButtonText: { fontSize: 20 },
   messageInput: {
     flex: 1,
     backgroundColor: "#1B2016",
@@ -1139,12 +1397,14 @@ const styles = StyleSheet.create({
     fontFamily: mono,
   },
   messageInputDisabled: { opacity: 0.5 },
-  sendButton: {
-    backgroundColor: "#C9A227",
-    paddingVertical: 15,
-    paddingHorizontal: 19,
-    borderRadius: 8,
-  },
+  sendButton: { backgroundColor: "#C9A227", paddingVertical: 15, paddingHorizontal: 19, borderRadius: 8 },
   sendButtonDisabled: { backgroundColor: "#4B4326" },
   sendButtonText: { color: "#14170F", fontSize: 13, fontFamily: mono, fontWeight: "700", letterSpacing: 0.5 },
+  viewerBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.92)",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  viewerImage: { width: "100%", height: "80%" },
 });

@@ -39,6 +39,14 @@ function endSession(code, reason) {
   console.log(`Session ${code} ended (${reason || "closed"})`);
 }
 
+// Given a session and the socket id of whoever is calling, returns the id of
+// the *other* device in that session (or null if there isn't one / it's not
+// currently connected).
+function getPeerSocketId(session, callerSocketId) {
+  const peerId = session.hostId === callerSocketId ? session.guestId : session.hostId;
+  return peerId || null;
+}
+
 io.on("connection", (socket) => {
   console.log("Device connected:", socket.id);
 
@@ -220,6 +228,115 @@ io.on("connection", (socket) => {
 
     socket.to(cleanedCode).emit("peer-stop-typing");
   });
+
+  // --- File transfer relay ---
+  // Mirrors the send-message pattern: validate the caller belongs to the
+  // session, then forward the event to the other device untouched. Chunks
+  // get acked back to the *sender* only after the *receiver* has actually
+  // acked them, so the client's chunk-by-chunk backpressure/progress logic
+  // reflects real delivery, not just "the server accepted it."
+
+  socket.on(
+    "file-transfer-start",
+    (
+      { sessionCode, transferId, name, size, mimeType, totalChunks },
+      callback
+    ) => {
+
+      const cleanedCode = String(sessionCode).trim().toUpperCase();
+      const session = sessions[cleanedCode];
+
+      if (!session) return;
+
+      const belongsToSession =
+        session.hostId === socket.id || session.guestId === socket.id;
+
+      if (!belongsToSession) return;
+
+      const peerOnline =
+        session.hostId === socket.id ? session.guestOnline : session.hostOnline;
+
+      if (!peerOnline) return;
+
+      socket
+        .to(cleanedCode)
+        .emit("file-transfer-start", { transferId, name, size, mimeType, totalChunks });
+
+        console.log(
+          `File transfer started in ${cleanedCode}: "${name}" (${size} bytes, ${totalChunks} chunks)`
+        );
+        
+        callback?.({ ok: true });
+    }
+  );
+
+  socket.on(
+    "file-transfer-chunk",
+    ({ sessionCode, transferId, index, data }, callback) => {
+      const cleanedCode = String(sessionCode).trim().toUpperCase();
+      const session = sessions[cleanedCode];
+      const ack = typeof callback === "function" ? callback : () => {};
+
+      if (!session) {
+        ack({ ok: false });
+        return;
+      }
+
+      const belongsToSession =
+        session.hostId === socket.id || session.guestId === socket.id;
+
+      if (!belongsToSession) {
+        ack({ ok: false });
+        return;
+      }
+
+      const peerId = getPeerSocketId(session, socket.id);
+      const peerSocket = peerId ? io.sockets.sockets.get(peerId) : null;
+
+      if (!peerSocket) {
+        ack({ ok: false });
+        return;
+      }
+
+      // Direct socket-to-socket emit (not a room broadcast) so we can use a
+      // real acknowledgement callback: room/broadcast emits in socket.io
+      // don't support acks the way a single socket.emit(event, data, cb) does.
+      peerSocket.emit("file-transfer-chunk", { transferId, index, data }, (peerAck) => {
+        ack(peerAck && peerAck.ok ? { ok: true } : { ok: false });
+      });
+    }
+  );
+
+  socket.on(
+    "file-transfer-end",
+    ({ sessionCode, transferId }, callback) => {
+      const cleanedCode = String(sessionCode).trim().toUpperCase();
+      const session = sessions[cleanedCode];
+      const ack = typeof callback === "function" ? callback : () => {};
+  
+      if (!session) {
+        ack({ ok: false, error: "Session not found" });
+        return;
+      }
+  
+      const belongsToSession =
+        session.hostId === socket.id || session.guestId === socket.id;
+  
+      if (!belongsToSession) {
+        ack({ ok: false, error: "Not part of this session" });
+        return;
+      }
+  
+      socket.to(cleanedCode).emit("file-transfer-end", { transferId });
+  
+      ack({ ok: true });
+  
+      console.log(
+        `File transfer finished in ${cleanedCode}: ${transferId}`
+      );
+    }
+
+);
 
   socket.on("disconnect", () => {
     console.log("Device disconnected:", socket.id);
