@@ -22,7 +22,7 @@ import * as ImagePicker from "expo-image-picker";
 import * as Sharing from "expo-sharing";
 import { io } from "socket.io-client";
 
-const socket = io("http://192.168.1.48:3000", {
+const socket = io("http://192.168.1.37:3000", {
   transports: ["websocket"],
   reconnection: true,
   reconnectionAttempts: 15,
@@ -31,7 +31,7 @@ const socket = io("http://192.168.1.48:3000", {
 });
 
 type MessageStatus = "sending" | "delivered" | "failed";
-type MessageKind = "text" | "image" | "file";
+type MessageKind = "text" | "image" | "file" | "voice";
 
 type ChatMessage = {
   id: string;
@@ -48,7 +48,8 @@ type ChatMessage = {
   fileSize?: number;
   mimeType?: string;
   data?: string; // base64 payload, used to render images inline
-  localUri?: string; // on-disk path once a "file" kind has been saved
+  localUri?: string; // on-disk path once a file/voice message has been saved
+  durationMs?: number; // voice-message duration
   progress?: number; // 0-100, used while a transfer is in flight
 };
 
@@ -215,6 +216,10 @@ export default function HomeScreen() {
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [viewerImage, setViewerImage] = useState<{ uri: string } | null>(null);
+  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [playingVoiceId, setPlayingVoiceId] = useState<string | null>(null);
 
   const scrollViewRef = useRef<ScrollView>(null);
   const logScrollRef = useRef<ScrollView>(null);
@@ -225,6 +230,8 @@ export default function HomeScreen() {
   const sessionCodeRef = useRef("");
   const pairedAtRef = useRef<number | null>(null);
   const notificationSoundRef = useRef<Audio.Sound | null>(null);
+  const voiceSoundRef = useRef<Audio.Sound | null>(null);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Tracks in-progress incoming transfers, keyed by transferId, so chunks
   // that arrive out of order (or interleaved with another transfer) still
@@ -278,6 +285,9 @@ export default function HomeScreen() {
       isMounted = false;
       notificationSoundRef.current?.unloadAsync();
       notificationSoundRef.current = null;
+      voiceSoundRef.current?.unloadAsync();
+      voiceSoundRef.current = null;
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     };
   }, []);
 
@@ -439,6 +449,7 @@ export default function HomeScreen() {
       mimeType: string;
       kind: MessageKind;
       totalChunks: number;
+      durationMs?: number;
     }) {
       const messageId = makeMessageId();
 
@@ -463,6 +474,7 @@ export default function HomeScreen() {
           fileName: payload.fileName,
           fileSize: payload.fileSize,
           mimeType: payload.mimeType,
+          durationMs: payload.durationMs,
           progress: 0,
         },
       ]);
@@ -583,6 +595,7 @@ export default function HomeScreen() {
 
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       if (copyFeedbackTimeoutRef.current) clearTimeout(copyFeedbackTimeoutRef.current);
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     };
   }, []);
 
@@ -757,7 +770,8 @@ export default function HomeScreen() {
     uri: string,
     fileName: string,
     mimeType: string,
-    kind: MessageKind
+    kind: MessageKind,
+    durationMs?: number
   ) {
     if (!sessionCode || !peerOnline) {
       Alert.alert("No peer connected", "Wait for the other device before sending.");
@@ -765,20 +779,46 @@ export default function HomeScreen() {
     }
   
     try {
-      const info = await FileSystem.getInfoAsync(uri);
-      const fileSize = info.exists && "size" in info ? info.size ?? 0 : 0;
-  
-      if (fileSize > MAX_FILE_BYTES) {
-        Alert.alert(
-          "File too large",
-          `Files are limited to ${formatFileSize(MAX_FILE_BYTES)} for now.`
-        );
+      let fileSize = 0;
+let base64 = "";
+
+if (Platform.OS === "web") {
+  const response = await fetch(uri);
+  const blob = await response.blob();
+
+  fileSize = blob.size;
+
+  base64 = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onloadend = () => {
+      if (typeof reader.result !== "string") {
+        reject(new Error("Failed to read file"));
         return;
       }
-  
-      const base64 = await FileSystem.readAsStringAsync(uri, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
+
+      resolve(reader.result.split(",")[1]);
+    };
+
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+} else {
+  const info = await FileSystem.getInfoAsync(uri);
+  fileSize = info.exists && "size" in info ? info.size ?? 0 : 0;
+
+  base64 = await FileSystem.readAsStringAsync(uri, {
+    encoding: FileSystem.EncodingType.Base64,
+  });
+}
+
+if (fileSize > MAX_FILE_BYTES) {
+  Alert.alert(
+    "File too large",
+    `Files are limited to ${formatFileSize(MAX_FILE_BYTES)} for now.`
+  );
+  return;
+}
   
       const totalChunks = Math.max(
         1,
@@ -799,6 +839,7 @@ export default function HomeScreen() {
         localUri: uri,
         status: "sending",
         progress: 0,
+        durationMs,
       };
   
       setMessages((current) => [...current, localMessage]);
@@ -813,6 +854,8 @@ export default function HomeScreen() {
           size: fileSize,
           mimeType,
           totalChunks,
+          kind,
+          durationMs,
         },
         (response: { ok: boolean; error?: string }) => {
           console.log("START ACK:", response);
@@ -878,6 +921,107 @@ export default function HomeScreen() {
         "Couldn't send that",
         "Something went wrong reading the file."
       );
+    }
+  }
+
+  async function startRecording() {
+    if (!canSendComputed()) {
+      Alert.alert("No peer connected", "Wait for the other device before recording.");
+      return;
+    }
+
+    try {
+      const permission = await Audio.requestPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert("Permission needed", "Microphone access is required to record voice messages.");
+        return;
+      }
+
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      const { recording: newRecording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+
+      setRecording(newRecording);
+      setIsRecording(true);
+      setRecordingSeconds(0);
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingSeconds((current) => current + 1);
+      }, 1000);
+      logActivity("Voice recording started", "info");
+    } catch (error) {
+      console.warn("Could not start recording", error);
+      Alert.alert("Recording failed", "The microphone could not be started.");
+    }
+  }
+
+  async function stopRecording() {
+    if (!recording) return;
+
+    try {
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+
+      const statusBeforeStop = await recording.getStatusAsync();
+      await recording.stopAndUnloadAsync();
+      const uri = recording.getURI();
+
+const durationMs =
+  statusBeforeStop.durationMillis ?? recordingSeconds * 1000;
+      setRecording(null);
+      setIsRecording(false);
+      setRecordingSeconds(0);
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true });
+
+      if (!uri) throw new Error("Recording URI missing");
+      const extension = Platform.OS === "web" ? "webm" : "m4a";
+      const mimeType = Platform.OS === "web" ? "audio/webm" : "audio/m4a";
+      await sendAttachment(uri, `voice-${Date.now()}.${extension}`, mimeType, "voice", durationMs);
+    } catch (error) {
+      console.warn("Could not stop recording", error);
+      setRecording(null);
+      setIsRecording(false);
+      setRecordingSeconds(0);
+      Alert.alert("Voice message failed", "The recording could not be sent.");
+    }
+  }
+
+  async function toggleVoicePlayback(chatMessage: ChatMessage) {
+    if (!chatMessage.localUri) return;
+
+    try {
+      if (playingVoiceId === chatMessage.id && voiceSoundRef.current) {
+        const status = await voiceSoundRef.current.getStatusAsync();
+        if (status.isLoaded && status.isPlaying) {
+          await voiceSoundRef.current.pauseAsync();
+          setPlayingVoiceId(null);
+          return;
+        }
+      }
+
+      if (voiceSoundRef.current) {
+        await voiceSoundRef.current.unloadAsync();
+        voiceSoundRef.current = null;
+      }
+
+      const { sound } = await Audio.Sound.createAsync(
+        { uri: chatMessage.localUri },
+        { shouldPlay: true }
+      );
+      voiceSoundRef.current = sound;
+      setPlayingVoiceId(chatMessage.id);
+      sound.setOnPlaybackStatusUpdate((status) => {
+        if (status.isLoaded && status.didJustFinish) {
+          setPlayingVoiceId(null);
+          sound.unloadAsync();
+          if (voiceSoundRef.current === sound) voiceSoundRef.current = null;
+        }
+      });
+    } catch (error) {
+      console.warn("Could not play voice message", error);
+      Alert.alert("Playback failed", "This voice message could not be played.");
     }
   }
 
@@ -1120,6 +1264,18 @@ export default function HomeScreen() {
                           </View>
                         )}
                       </Pressable>
+                    ) : chatMessage.kind === "voice" ? (
+                      <Pressable style={styles.voiceCard} onPress={() => toggleVoicePlayback(chatMessage)}>
+                        <Text style={styles.voicePlayButton}>
+                          {playingVoiceId === chatMessage.id ? "❚❚" : "▶"}
+                        </Text>
+                        <View style={styles.voiceInfo}>
+                          <Text style={styles.voiceLabel}>VOICE MESSAGE</Text>
+                          <Text style={styles.voiceDuration}>
+                            {formatElapsed(Math.round((chatMessage.durationMs ?? 0) / 1000))}
+                          </Text>
+                        </View>
+                      </Pressable>
                     ) : (
                       <View style={styles.fileCard}>
                         <Text style={styles.fileGlyph}>{fileGlyph(chatMessage.mimeType)}</Text>
@@ -1164,6 +1320,14 @@ export default function HomeScreen() {
             {peerTyping ? <Text style={styles.typingText}>Peer is transmitting...</Text> : null}
           </ScrollView>
 
+          {isRecording ? (
+            <View style={styles.recordingBanner}>
+              <Text style={styles.recordingDot}>●</Text>
+              <Text style={styles.recordingText}>RECORDING {formatElapsed(recordingSeconds)}</Text>
+              <Text style={styles.recordingHint}>tap stop to send</Text>
+            </View>
+          ) : null}
+
           <View style={styles.sendRow}>
             <AnimatedPressable
               style={[styles.attachButton, !canSend && styles.attachButtonDisabled]}
@@ -1171,6 +1335,18 @@ export default function HomeScreen() {
               disabled={!canSend}
             >
               <Text style={styles.attachButtonText}>📎</Text>
+            </AnimatedPressable>
+
+            <AnimatedPressable
+              style={[
+                styles.micButton,
+                !canSend && styles.attachButtonDisabled,
+                isRecording && styles.micButtonRecording,
+              ]}
+              onPress={isRecording ? stopRecording : startRecording}
+              disabled={!canSend}
+            >
+              <Text style={styles.micButtonText}>{isRecording ? "■" : "🎤"}</Text>
             </AnimatedPressable>
 
             <TextInput
@@ -1354,6 +1530,11 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   imagePlaceholderText: { color: "#7C8570", fontFamily: mono, fontSize: 12 },
+  voiceCard: { flexDirection: "row", alignItems: "center", gap: 12, minWidth: 190, paddingVertical: 4 },
+  voicePlayButton: { color: "#C9A227", fontSize: 22, width: 30, textAlign: "center" },
+  voiceInfo: { flex: 1 },
+  voiceLabel: { color: "#EDE9DC", fontSize: 12, fontFamily: mono, letterSpacing: 1 },
+  voiceDuration: { color: "#7C8570", fontSize: 11, fontFamily: mono, marginTop: 3 },
   fileCard: { flexDirection: "row", alignItems: "center", gap: 10, minWidth: 180 },
   fileGlyph: { fontSize: 26 },
   fileCardInfo: { flexShrink: 1 },
@@ -1372,6 +1553,10 @@ const styles = StyleSheet.create({
   statusText2: { color: "#5F6653", fontFamily: mono, fontSize: 10 },
   statusFailed: { color: "#D4877A" },
   typingText: { color: "#7C8570", fontFamily: mono, fontSize: 12, fontStyle: "italic", marginTop: 6 },
+  recordingBanner: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 8, backgroundColor: "#241817", borderWidth: 1, borderColor: "#4B2A2A" },
+  recordingDot: { color: "#E0645A", fontSize: 12 },
+  recordingText: { color: "#EDE9DC", fontFamily: mono, fontSize: 12, flex: 1 },
+  recordingHint: { color: "#7C8570", fontFamily: mono, fontSize: 10 },
   sendRow: { flexDirection: "row", alignItems: "center", gap: 10 },
   attachButton: {
     width: 48,
@@ -1383,6 +1568,9 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+  micButton: { width: 48, height: 48, borderRadius: 8, borderWidth: 1, borderColor: "#2B3122", backgroundColor: "#1B2016", alignItems: "center", justifyContent: "center" },
+  micButtonRecording: { backgroundColor: "#4B2A2A", borderColor: "#E0645A" },
+  micButtonText: { fontSize: 18, color: "#EDE9DC" },
   attachButtonDisabled: { opacity: 0.5 },
   attachButtonText: { fontSize: 20 },
   messageInput: {

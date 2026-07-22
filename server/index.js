@@ -239,7 +239,16 @@ io.on("connection", (socket) => {
   socket.on(
     "file-transfer-start",
     (
-      { sessionCode, transferId, name, size, mimeType, totalChunks },
+      {
+        sessionCode,
+        transferId,
+        name,
+        size,
+        mimeType,
+        totalChunks,
+        kind,
+        durationMs,
+      },
       callback
     ) => {
 
@@ -259,9 +268,16 @@ io.on("connection", (socket) => {
       if (!peerOnline) return;
 
       socket
-        .to(cleanedCode)
-        .emit("file-transfer-start", { transferId, name, size, mimeType, totalChunks });
-
+  .to(cleanedCode)
+  .emit("file-transfer-start", {
+    transferId,
+    fileName: name,
+    fileSize: size,
+    mimeType,
+    totalChunks,
+    kind,
+    durationMs,
+  });
         console.log(
           `File transfer started in ${cleanedCode}: "${name}" (${size} bytes, ${totalChunks} chunks)`
         );
