@@ -22,7 +22,7 @@ import * as ImagePicker from "expo-image-picker";
 import * as Sharing from "expo-sharing";
 import { io } from "socket.io-client";
 
-const socket = io("http://192.168.1.37:3000", {
+const socket = io("https://connectionapp-production-393c.up.railway.app", {
   transports: ["websocket"],
   reconnection: true,
   reconnectionAttempts: 15,
