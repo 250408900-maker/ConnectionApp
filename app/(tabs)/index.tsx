@@ -207,6 +207,7 @@ export default function HomeScreen() {
   const [linkState, setLinkState] = useState<LinkState>("connecting");
   const [peerOnline, setPeerOnline] = useState(false);
   const [peerTyping, setPeerTyping] = useState(false);
+  const [incomingCall, setIncomingCall] = useState(false);
 
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -548,6 +549,10 @@ export default function HomeScreen() {
       setPeerTyping(false);
     }
 
+    socket.on("incoming-call", () => {
+      Alert.alert("Incoming Call", "Peer is calling you!");
+    });
+
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
     socket.on("reconnect_attempt", handleReconnectAttempt);
@@ -654,6 +659,17 @@ export default function HomeScreen() {
         },
       },
     ]);
+  }
+  function startCall() {
+    console.log("📱 Sending call...", sessionCode);
+  
+    if (!sessionCode) return;
+  
+    socket.emit("call-user", {
+      sessionCode,
+    });
+  
+    Alert.alert("Voice Link", "Calling peer...");
   }
 
   function handleMessageChange(text: string) {
@@ -1097,10 +1113,95 @@ const durationMs =
 
   return (
     <View style={styles.container}>
-      <View style={styles.header}>
-        <Text style={styles.eyebrow}>PEER-TO-PEER · SHORT RANGE</Text>
-        <Text style={styles.title}>Field Link</Text>
-      </View>
+
+{incomingCall && (
+  <View
+    style={{
+      position: "absolute",
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      backgroundColor: "rgba(0,0,0,0.9)",
+      justifyContent: "center",
+      alignItems: "center",
+      zIndex: 999,
+    }}
+  >
+    <Text
+      style={{
+        color: "#fff",
+        fontSize: 30,
+        fontWeight: "bold",
+        marginBottom: 10,
+      }}
+    >
+      📞 Incoming Call
+    </Text>
+
+    <Text
+      style={{
+        color: "#aaa",
+        marginBottom: 30,
+      }}
+    >
+      Your peer is calling...
+    </Text>
+
+    <Pressable
+      onPress={() => setIncomingCall(false)}
+      style={{
+        backgroundColor: "#1db954",
+        paddingHorizontal: 30,
+        paddingVertical: 15,
+        borderRadius: 10,
+        marginBottom: 15,
+      }}
+    >
+      <Text style={{ color: "white", fontWeight: "bold" }}>
+        Answer
+      </Text>
+    </Pressable>
+
+    <Pressable
+      onPress={() => setIncomingCall(false)}
+      style={{
+        backgroundColor: "#d32f2f",
+        paddingHorizontal: 30,
+        paddingVertical: 15,
+        borderRadius: 10,
+      }}
+    >
+      <Text style={{ color: "white", fontWeight: "bold" }}>
+        Decline
+      </Text>
+    </Pressable>
+  </View>
+)}
+
+<View style={styles.header}>
+  <Text style={styles.eyebrow}>PEER-TO-PEER • SHORT RANGE</Text>
+
+  <View
+    style={{
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+    }}
+  >
+    <Text style={styles.title}>Field Link</Text>
+
+    <Pressable
+  onPress={() => {
+    alert("HELLO");
+    console.log("HELLO");
+  }}
+>
+  <Text style={{ fontSize: 22 }}>📞</Text>
+</Pressable>
+  </View>
+</View>
+      
 
       <Pressable style={styles.statusRow} onPress={() => setShowLog((v) => !v)}>
         <View style={styles.statusRowLeft}>
