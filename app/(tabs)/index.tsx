@@ -30,6 +30,42 @@ const socket = io("https://connectionapp-production-393c.up.railway.app", {
   reconnectionDelayMax: 6000,
 });
 
+// ---- WebRTC platform shim ----
+// react-native-webrtc is a native module and cannot run on web. On web we
+// use the browser's built-in WebRTC globals instead. On native we lazily
+// require react-native-webrtc so the web bundler never tries to load it.
+const isWeb = Platform.OS === "web";
+
+const RTCPeerConnection: any = isWeb
+  ? (globalThis as any).RTCPeerConnection
+  : require("react-native-webrtc").RTCPeerConnection;
+
+const RTCSessionDescription: any = isWeb
+  ? (globalThis as any).RTCSessionDescription
+  : require("react-native-webrtc").RTCSessionDescription;
+
+const RTCIceCandidate: any = isWeb
+  ? (globalThis as any).RTCIceCandidate
+  : require("react-native-webrtc").RTCIceCandidate;
+
+async function getMicStream(): Promise<any> {
+  if (isWeb) {
+    return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  }
+  const { mediaDevices } = require("react-native-webrtc");
+  return mediaDevices.getUserMedia({ audio: true, video: false });
+}
+
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    // Add a TURN server here for reliability off local wifi, e.g.:
+    // { urls: "turn:your.turn.host:3478", username: "user", credential: "pass" },
+  ],
+};
+
+type CallState = "idle" | "calling" | "ringing" | "connected";
+
 type MessageStatus = "sending" | "delivered" | "failed";
 type MessageKind = "text" | "image" | "file" | "voice";
 
@@ -222,6 +258,11 @@ export default function HomeScreen() {
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [playingVoiceId, setPlayingVoiceId] = useState<string | null>(null);
 
+  // ---- Call state ----
+  const [callState, setCallState] = useState<CallState>("idle");
+  const [callSeconds, setCallSeconds] = useState(0);
+  const [isMuted, setIsMuted] = useState(false);
+
   const scrollViewRef = useRef<ScrollView>(null);
   const logScrollRef = useRef<ScrollView>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -233,6 +274,13 @@ export default function HomeScreen() {
   const notificationSoundRef = useRef<Audio.Sound | null>(null);
   const voiceSoundRef = useRef<Audio.Sound | null>(null);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ---- Call refs ----
+  const peerConnectionRef = useRef<any>(null);
+  const localStreamRef = useRef<any>(null);
+  const pendingCandidatesRef = useRef<any[]>([]);
+  const incomingOfferRef = useRef<any>(null);
+  const callTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Tracks in-progress incoming transfers, keyed by transferId, so chunks
   // that arrive out of order (or interleaved with another transfer) still
@@ -289,6 +337,8 @@ export default function HomeScreen() {
       voiceSoundRef.current?.unloadAsync();
       voiceSoundRef.current = null;
       if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+      if (callTimerRef.current) clearInterval(callTimerRef.current);
+      cleanupCall();
     };
   }, []);
 
@@ -320,6 +370,16 @@ export default function HomeScreen() {
     }
   }, [peerOnline, sessionCode]);
 
+  // Call duration timer
+  useEffect(() => {
+    if (callState === "connected") {
+      callTimerRef.current = setInterval(() => setCallSeconds((s) => s + 1), 1000);
+      return () => {
+        if (callTimerRef.current) clearInterval(callTimerRef.current);
+      };
+    }
+  }, [callState]);
+
   useEffect(() => {
     const timeout = setTimeout(() => {
       scrollViewRef.current?.scrollToEnd({ animated: true });
@@ -335,6 +395,7 @@ export default function HomeScreen() {
       setPeerTyping(false);
       roleRef.current = null;
       incomingTransfersRef.current = {};
+      cleanupCall();
     }
 
     function handleConnect() {
@@ -535,6 +596,7 @@ export default function HomeScreen() {
     }
 
     function handleSessionEnded() {
+      cleanupCall();
       resetSessionState();
       setLinkState("closed");
       logActivity("Channel ended", "bad");
@@ -549,9 +611,48 @@ export default function HomeScreen() {
       setPeerTyping(false);
     }
 
-    socket.on("incoming-call", () => {
-      Alert.alert("Incoming Call", "Peer is calling you!");
-    });
+    // ---- Call signaling ----
+
+    function handleIncomingCall(payload: { offer: any }) {
+      if (callState !== "idle") {
+        socket.emit("call-declined", { sessionCode: sessionCodeRef.current });
+        return;
+      }
+      incomingOfferRef.current = payload.offer;
+      setCallState("ringing");
+      setIncomingCall(true);
+      logActivity("Incoming call", "info");
+      playNotificationSound();
+    }
+
+    async function handleCallAccepted(payload: { answer: any }) {
+      const pc = peerConnectionRef.current;
+      if (!pc) return;
+      await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
+      await flushPendingCandidates(pc);
+      setCallState("connected");
+      logActivity("Call connected", "good");
+    }
+
+    function handleCallDeclined() {
+      Alert.alert("Call declined", "The peer declined the call.");
+      cleanupCall();
+    }
+
+    function handleCallEndedRemote() {
+      cleanupCall();
+      logActivity("Call ended", "info");
+    }
+
+    async function handleCallIceCandidate(payload: { candidate: any }) {
+      const pc = peerConnectionRef.current;
+      const candidate = new RTCIceCandidate(payload.candidate);
+      if (pc && pc.remoteDescription) {
+        await pc.addIceCandidate(candidate);
+      } else {
+        pendingCandidatesRef.current.push(candidate);
+      }
+    }
 
     socket.on("connect", handleConnect);
     socket.on("disconnect", handleDisconnect);
@@ -572,6 +673,12 @@ export default function HomeScreen() {
     socket.on("session-ended", handleSessionEnded);
     socket.on("peer-typing", handlePeerTyping);
     socket.on("peer-stop-typing", handlePeerStopTyping);
+
+    socket.on("incoming-call", handleIncomingCall);
+    socket.on("call-accepted", handleCallAccepted);
+    socket.on("call-declined", handleCallDeclined);
+    socket.on("call-ice-candidate", handleCallIceCandidate);
+    socket.on("call-ended", handleCallEndedRemote);
 
     if (socket.connected) {
       handleConnect();
@@ -598,11 +705,18 @@ export default function HomeScreen() {
       socket.off("peer-typing", handlePeerTyping);
       socket.off("peer-stop-typing", handlePeerStopTyping);
 
+      socket.off("incoming-call", handleIncomingCall);
+      socket.off("call-accepted", handleCallAccepted);
+      socket.off("call-declined", handleCallDeclined);
+      socket.off("call-ice-candidate", handleCallIceCandidate);
+      socket.off("call-ended", handleCallEndedRemote);
+
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       if (copyFeedbackTimeoutRef.current) clearTimeout(copyFeedbackTimeoutRef.current);
       if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [callState]);
 
   function createSession() {
     socket.emit("create-session");
@@ -660,16 +774,148 @@ export default function HomeScreen() {
       },
     ]);
   }
-  function startCall() {
-    console.log("📱 Sending call...", sessionCode);
-  
-    if (!sessionCode) return;
-  
-    socket.emit("call-user", {
-      sessionCode,
+
+  // ---- Call handling ----
+
+  function createPeerConnection() {
+    const pc = new RTCPeerConnection(ICE_SERVERS);
+
+    pc.addEventListener("icecandidate", (event: any) => {
+      if (event.candidate) {
+        socket.emit("call-ice-candidate", { sessionCode, candidate: event.candidate });
+      }
     });
-  
-    Alert.alert("Voice Link", "Calling peer...");
+
+    pc.addEventListener("connectionstatechange", () => {
+      if (pc.connectionState === "connected") {
+        setCallState("connected");
+      }
+      if (["failed", "disconnected", "closed"].includes(pc.connectionState)) {
+        cleanupCall();
+      }
+    });
+
+    if (isWeb) {
+      pc.addEventListener("track", (event: any) => {
+        const [remoteStream] = event.streams;
+        let audioEl = document.getElementById("call-audio") as HTMLAudioElement | null;
+        if (!audioEl) {
+          audioEl = document.createElement("audio");
+          audioEl.id = "call-audio";
+          audioEl.autoplay = true;
+          document.body.appendChild(audioEl);
+        }
+        audioEl.srcObject = remoteStream;
+      });
+    }
+
+    peerConnectionRef.current = pc;
+    return pc;
+  }
+
+  async function flushPendingCandidates(pc: any) {
+    for (const candidate of pendingCandidatesRef.current) {
+      await pc.addIceCandidate(candidate);
+    }
+    pendingCandidatesRef.current = [];
+  }
+
+  function cleanupCall() {
+    localStreamRef.current?.getTracks().forEach((track: any) => track.stop());
+    localStreamRef.current = null;
+
+    peerConnectionRef.current?.close();
+    peerConnectionRef.current = null;
+
+    pendingCandidatesRef.current = [];
+    incomingOfferRef.current = null;
+
+    if (callTimerRef.current) {
+      clearInterval(callTimerRef.current);
+      callTimerRef.current = null;
+    }
+
+    setCallState("idle");
+    setCallSeconds(0);
+    setIsMuted(false);
+    setIncomingCall(false);
+  }
+
+  async function startCall() {
+    if (!canSendComputed()) {
+      Alert.alert("No peer connected", "Wait for the other device before calling.");
+      return;
+    }
+    if (callState !== "idle") return;
+
+    try {
+      const stream = await getMicStream();
+      localStreamRef.current = stream;
+
+      const pc = createPeerConnection();
+      stream.getTracks().forEach((track: any) => pc.addTrack(track, stream));
+
+      const offer = await pc.createOffer({});
+      await pc.setLocalDescription(offer);
+
+      setCallState("calling");
+      socket.emit("call-user", { sessionCode, offer });
+      logActivity("Calling peer...", "info");
+    } catch (error) {
+      console.warn("startCall failed", error);
+      Alert.alert("Call failed", "Could not access the microphone.");
+      cleanupCall();
+    }
+  }
+
+  async function acceptCall() {
+    const offer = incomingOfferRef.current;
+    if (!offer) return;
+
+    try {
+      const stream = await getMicStream();
+      localStreamRef.current = stream;
+
+      const pc = createPeerConnection();
+      stream.getTracks().forEach((track: any) => pc.addTrack(track, stream));
+
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      await flushPendingCandidates(pc);
+
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      socket.emit("call-accepted", { sessionCode, answer });
+      setIncomingCall(false);
+      setCallState("connected");
+      logActivity("Call connected", "good");
+    } catch (error) {
+      console.warn("acceptCall failed", error);
+      Alert.alert("Call failed", "Could not access the microphone.");
+      declineCall();
+    }
+  }
+
+  function declineCall() {
+    socket.emit("call-declined", { sessionCode });
+    cleanupCall();
+  }
+
+  function endCall() {
+    if (sessionCode && callState !== "idle") {
+      socket.emit("call-ended", { sessionCode });
+    }
+    cleanupCall();
+  }
+
+  function toggleMute() {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+    const nextEnabled = isMuted; // currently muted -> re-enable
+    stream.getAudioTracks().forEach((track: any) => {
+      track.enabled = nextEnabled;
+    });
+    setIsMuted((m) => !m);
   }
 
   function handleMessageChange(text: string) {
@@ -793,56 +1039,53 @@ export default function HomeScreen() {
       Alert.alert("No peer connected", "Wait for the other device before sending.");
       return;
     }
-  
+
     try {
       let fileSize = 0;
-let base64 = "";
+      let base64 = "";
 
-if (Platform.OS === "web") {
-  const response = await fetch(uri);
-  const blob = await response.blob();
+      if (Platform.OS === "web") {
+        const response = await fetch(uri);
+        const blob = await response.blob();
 
-  fileSize = blob.size;
+        fileSize = blob.size;
 
-  base64 = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
+        base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
 
-    reader.onloadend = () => {
-      if (typeof reader.result !== "string") {
-        reject(new Error("Failed to read file"));
+          reader.onloadend = () => {
+            if (typeof reader.result !== "string") {
+              reject(new Error("Failed to read file"));
+              return;
+            }
+
+            resolve(reader.result.split(",")[1]);
+          };
+
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+      } else {
+        const info = await FileSystem.getInfoAsync(uri);
+        fileSize = info.exists && "size" in info ? info.size ?? 0 : 0;
+
+        base64 = await FileSystem.readAsStringAsync(uri, {
+          encoding: FileSystem.EncodingType.Base64,
+        });
+      }
+
+      if (fileSize > MAX_FILE_BYTES) {
+        Alert.alert(
+          "File too large",
+          `Files are limited to ${formatFileSize(MAX_FILE_BYTES)} for now.`
+        );
         return;
       }
 
-      resolve(reader.result.split(",")[1]);
-    };
+      const totalChunks = Math.max(1, Math.ceil(base64.length / CHUNK_SIZE));
 
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-} else {
-  const info = await FileSystem.getInfoAsync(uri);
-  fileSize = info.exists && "size" in info ? info.size ?? 0 : 0;
-
-  base64 = await FileSystem.readAsStringAsync(uri, {
-    encoding: FileSystem.EncodingType.Base64,
-  });
-}
-
-if (fileSize > MAX_FILE_BYTES) {
-  Alert.alert(
-    "File too large",
-    `Files are limited to ${formatFileSize(MAX_FILE_BYTES)} for now.`
-  );
-  return;
-}
-  
-      const totalChunks = Math.max(
-        1,
-        Math.ceil(base64.length / CHUNK_SIZE)
-      );
-  
       const transferId = makeMessageId();
-  
+
       const localMessage: ChatMessage = {
         id: transferId,
         kind,
@@ -857,10 +1100,10 @@ if (fileSize > MAX_FILE_BYTES) {
         progress: 0,
         durationMs,
       };
-  
+
       setMessages((current) => [...current, localMessage]);
       logActivity(`Sending ${kind}: ${fileName}`, "info");
-  
+
       socket.emit(
         "file-transfer-start",
         {
@@ -877,13 +1120,10 @@ if (fileSize > MAX_FILE_BYTES) {
           console.log("START ACK:", response);
         }
       );
-  
+
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-        const chunk = base64.slice(
-          chunkIndex * CHUNK_SIZE,
-          (chunkIndex + 1) * CHUNK_SIZE
-        );
-  
+        const chunk = base64.slice(chunkIndex * CHUNK_SIZE, (chunkIndex + 1) * CHUNK_SIZE);
+
         socket.emit(
           "file-transfer-chunk",
           {
@@ -896,18 +1136,12 @@ if (fileSize > MAX_FILE_BYTES) {
             console.log("CHUNK ACK:", response);
           }
         );
-  
-        const progress = Math.round(
-          ((chunkIndex + 1) / totalChunks) * 100
-        );
-  
-        setMessages((current) =>
-          current.map((m) =>
-            m.id === transferId ? { ...m, progress } : m
-          )
-        );
+
+        const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+
+        setMessages((current) => current.map((m) => (m.id === transferId ? { ...m, progress } : m)));
       }
-  
+
       socket.emit(
         "file-transfer-end",
         { transferId, sessionCode },
@@ -923,7 +1157,7 @@ if (fileSize > MAX_FILE_BYTES) {
                 : m
             )
           );
-  
+
           if (response?.ok) {
             logActivity(`Sent ${kind}: ${fileName}`, "good");
           } else {
@@ -933,10 +1167,7 @@ if (fileSize > MAX_FILE_BYTES) {
       );
     } catch (error) {
       console.warn("sendAttachment failed", error);
-      Alert.alert(
-        "Couldn't send that",
-        "Something went wrong reading the file."
-      );
+      Alert.alert("Couldn't send that", "Something went wrong reading the file.");
     }
   }
 
@@ -984,8 +1215,7 @@ if (fileSize > MAX_FILE_BYTES) {
       await recording.stopAndUnloadAsync();
       const uri = recording.getURI();
 
-const durationMs =
-  statusBeforeStop.durationMillis ?? recordingSeconds * 1000;
+      const durationMs = statusBeforeStop.durationMillis ?? recordingSeconds * 1000;
       setRecording(null);
       setIsRecording(false);
       setRecordingSeconds(0);
@@ -1113,95 +1343,84 @@ const durationMs =
 
   return (
     <View style={styles.container}>
+      {incomingCall && (
+        <View
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: "rgba(0,0,0,0.9)",
+            justifyContent: "center",
+            alignItems: "center",
+            zIndex: 999,
+          }}
+        >
+          <Text
+            style={{
+              color: "#fff",
+              fontSize: 30,
+              fontWeight: "bold",
+              marginBottom: 10,
+            }}
+          >
+            📞 Incoming Call
+          </Text>
 
-{incomingCall && (
-  <View
-    style={{
-      position: "absolute",
-      top: 0,
-      left: 0,
-      right: 0,
-      bottom: 0,
-      backgroundColor: "rgba(0,0,0,0.9)",
-      justifyContent: "center",
-      alignItems: "center",
-      zIndex: 999,
-    }}
-  >
-    <Text
-      style={{
-        color: "#fff",
-        fontSize: 30,
-        fontWeight: "bold",
-        marginBottom: 10,
-      }}
-    >
-      📞 Incoming Call
-    </Text>
+          <Text
+            style={{
+              color: "#aaa",
+              marginBottom: 30,
+            }}
+          >
+            Your peer is calling...
+          </Text>
 
-    <Text
-      style={{
-        color: "#aaa",
-        marginBottom: 30,
-      }}
-    >
-      Your peer is calling...
-    </Text>
+          <Pressable
+            onPress={acceptCall}
+            style={{
+              backgroundColor: "#1db954",
+              paddingHorizontal: 30,
+              paddingVertical: 15,
+              borderRadius: 10,
+              marginBottom: 15,
+            }}
+          >
+            <Text style={{ color: "white", fontWeight: "bold" }}>Answer</Text>
+          </Pressable>
 
-    <Pressable
-      onPress={() => setIncomingCall(false)}
-      style={{
-        backgroundColor: "#1db954",
-        paddingHorizontal: 30,
-        paddingVertical: 15,
-        borderRadius: 10,
-        marginBottom: 15,
-      }}
-    >
-      <Text style={{ color: "white", fontWeight: "bold" }}>
-        Answer
-      </Text>
-    </Pressable>
+          <Pressable
+            onPress={declineCall}
+            style={{
+              backgroundColor: "#d32f2f",
+              paddingHorizontal: 30,
+              paddingVertical: 15,
+              borderRadius: 10,
+            }}
+          >
+            <Text style={{ color: "white", fontWeight: "bold" }}>Decline</Text>
+          </Pressable>
+        </View>
+      )}
 
-    <Pressable
-      onPress={() => setIncomingCall(false)}
-      style={{
-        backgroundColor: "#d32f2f",
-        paddingHorizontal: 30,
-        paddingVertical: 15,
-        borderRadius: 10,
-      }}
-    >
-      <Text style={{ color: "white", fontWeight: "bold" }}>
-        Decline
-      </Text>
-    </Pressable>
-  </View>
-)}
+      <View style={styles.header}>
+        <Text style={styles.eyebrow}>PEER-TO-PEER • SHORT RANGE</Text>
 
-<View style={styles.header}>
-  <Text style={styles.eyebrow}>PEER-TO-PEER • SHORT RANGE</Text>
+        <View
+          style={{
+            flexDirection: "row",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <Text style={styles.title}>Field Link</Text>
 
-  <View
-    style={{
-      flexDirection: "row",
-      alignItems: "center",
-      justifyContent: "space-between",
-    }}
-  >
-    <Text style={styles.title}>Field Link</Text>
-
-    <Pressable
-  onPress={() => {
-    alert("HELLO");
-    console.log("HELLO");
-  }}
->
-  <Text style={{ fontSize: 22 }}>📞</Text>
-</Pressable>
-  </View>
-</View>
-      
+          <Pressable onPress={startCall} disabled={callState !== "idle"}>
+            <Text style={{ fontSize: 22, opacity: callState !== "idle" ? 0.4 : 1 }}>📞</Text>
+          </Pressable>
+        </View>
+      </View>
 
       <Pressable style={styles.statusRow} onPress={() => setShowLog((v) => !v)}>
         <View style={styles.statusRowLeft}>
@@ -1309,6 +1528,20 @@ const durationMs =
               </AnimatedPressable>
             </View>
           </View>
+
+          {callState === "calling" || callState === "connected" ? (
+            <View style={styles.recordingBanner}>
+              <Text style={styles.recordingText}>
+                {callState === "calling" ? "Calling…" : `On call ${formatElapsed(callSeconds)}`}
+              </Text>
+              <Pressable onPress={toggleMute} style={{ paddingHorizontal: 8 }}>
+                <Text style={{ color: "#EDE9DC", fontSize: 16 }}>{isMuted ? "🔇" : "🎙️"}</Text>
+              </Pressable>
+              <Pressable onPress={endCall} style={{ paddingHorizontal: 8 }}>
+                <Text style={{ color: "#E0645A", fontFamily: mono, fontSize: 12 }}>📞 End</Text>
+              </Pressable>
+            </View>
+          ) : null}
 
           <ScrollView
             ref={scrollViewRef}

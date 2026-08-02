@@ -103,6 +103,68 @@ io.on("connection", (socket) => {
     console.log(`${socket.id} joined session ${cleanedCode}`);
   });
 
+ // ---------- WebRTC Signaling ----------
+
+socket.on("call-user", ({ sessionCode, offer }) => {
+  const cleanedCode = String(sessionCode).trim().toUpperCase();
+  const session = sessions[cleanedCode];
+
+  if (!session) return;
+
+  const peerId = getPeerSocketId(session, socket.id);
+  if (!peerId) return;
+
+  io.to(peerId).emit("incoming-call", { offer });
+});
+
+socket.on("call-accepted", ({ sessionCode, answer }) => {
+  const cleanedCode = String(sessionCode).trim().toUpperCase();
+  const session = sessions[cleanedCode];
+
+  if (!session) return;
+
+  const peerId = getPeerSocketId(session, socket.id);
+  if (!peerId) return;
+
+  io.to(peerId).emit("call-accepted", { answer });
+});
+
+socket.on("call-declined", ({ sessionCode }) => {
+  const cleanedCode = String(sessionCode).trim().toUpperCase();
+  const session = sessions[cleanedCode];
+
+  if (!session) return;
+
+  const peerId = getPeerSocketId(session, socket.id);
+  if (!peerId) return;
+
+  io.to(peerId).emit("call-declined");
+});
+
+socket.on("call-ice-candidate", ({ sessionCode, candidate }) => {
+  const cleanedCode = String(sessionCode).trim().toUpperCase();
+  const session = sessions[cleanedCode];
+
+  if (!session) return;
+
+  const peerId = getPeerSocketId(session, socket.id);
+  if (!peerId) return;
+
+  io.to(peerId).emit("call-ice-candidate", { candidate });
+});
+
+socket.on("call-ended", ({ sessionCode }) => {
+  const cleanedCode = String(sessionCode).trim().toUpperCase();
+  const session = sessions[cleanedCode];
+
+  if (!session) return;
+
+  const peerId = getPeerSocketId(session, socket.id);
+  if (!peerId) return;
+
+  io.to(peerId).emit("call-ended");
+});
+
   socket.on("rejoin-session", ({ sessionCode, role }) => {
     const cleanedCode = String(sessionCode).trim().toUpperCase();
     const session = sessions[cleanedCode];
