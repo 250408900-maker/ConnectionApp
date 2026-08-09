@@ -281,6 +281,11 @@ export default function HomeScreen() {
   const pendingCandidatesRef = useRef<any[]>([]);
   const incomingOfferRef = useRef<any>(null);
   const callTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Mirrors `callState` so socket handlers (registered in an effect that no
+  // longer depends on callState) can always read the latest value without
+  // forcing that whole effect to tear down and re-run on every call-state
+  // change. See callStateRef sync effect below.
+  const callStateRef = useRef<CallState>("idle");
 
   // Tracks in-progress incoming transfers, keyed by transferId, so chunks
   // that arrive out of order (or interleaved with another transfer) still
@@ -303,6 +308,10 @@ export default function HomeScreen() {
   useEffect(() => {
     sessionCodeRef.current = sessionCode;
   }, [sessionCode]);
+
+  useEffect(() => {
+    callStateRef.current = callState;
+  }, [callState]);
 
   function logActivity(text: string, kind: ActivityEntry["kind"] = "info") {
     setActivityLog((current) => {
@@ -614,7 +623,7 @@ export default function HomeScreen() {
     // ---- Call signaling ----
 
     function handleIncomingCall(payload: { offer: any }) {
-      if (callState !== "idle") {
+      if (callStateRef.current !== "idle") {
         socket.emit("call-declined", { sessionCode: sessionCodeRef.current });
         return;
       }
@@ -715,8 +724,13 @@ export default function HomeScreen() {
       if (copyFeedbackTimeoutRef.current) clearTimeout(copyFeedbackTimeoutRef.current);
       if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [callState]);
+    // This effect intentionally has no dependencies: it registers the socket
+    // listeners exactly once. Call state is read via callStateRef.current
+    // inside handleIncomingCall instead, so a call starting/ending no longer
+    // tears down and re-creates every socket listener (which previously
+    // re-ran handleConnect() -> emitted a spurious "rejoin-session" ->
+    // server replied "Host slot already active" -> channel got reset).
+  }, []);
 
   function createSession() {
     socket.emit("create-session");
