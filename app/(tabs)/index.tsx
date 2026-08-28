@@ -22,14 +22,15 @@ import * as ImagePicker from "expo-image-picker";
 import * as Sharing from "expo-sharing";
 import { io } from "socket.io-client";
 
-const socket = io("https://connectionapp-production-393c.up.railway.app", {
+const SERVER_URL = "http://130.61.28.42:3000";
+
+const socket = io(SERVER_URL, {
   transports: ["websocket"],
   reconnection: true,
-  reconnectionAttempts: 15,
+  reconnectionAttempts: 5,
   reconnectionDelay: 1000,
-  reconnectionDelayMax: 6000,
+  reconnectionDelayMax: 5000,
 });
-
 // ---- WebRTC platform shim ----
 // react-native-webrtc is a native module and cannot run on web. On web we
 // use the browser's built-in WebRTC globals instead. On native we lazily
