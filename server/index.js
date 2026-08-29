@@ -2,28 +2,56 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 
+const PORT = Number(process.env.PORT) || 3000;
+const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const RECONNECT_GRACE_MS = 20000;
+const MAX_MESSAGE_CHARS = 4000;
+const MAX_CHUNK_CHARS = 80000;
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+const MAX_FILENAME_CHARS = 180;
+const SESSION_CODE_RE = /^[A-Z0-9]{6}$/;
+const ALLOWED_KINDS = new Set(["image", "file", "voice"]);
+
 const app = express();
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: CORS_ORIGIN === "*" ? "*" : CORS_ORIGIN.split(",").map((value) => value.trim()),
     methods: ["GET", "POST"],
   },
+  maxHttpBufferSize: 1e6,
+  pingTimeout: 20000,
+  pingInterval: 25000,
 });
 
 const sessions = {};
-const RECONNECT_GRACE_MS = 20000;
 
 function generateCode() {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   let code = "";
-
   for (let i = 0; i < 6; i++) {
     code += characters[Math.floor(Math.random() * characters.length)];
   }
-
   return code;
+}
+
+function parseSessionCode(code) {
+  const cleaned = String(code ?? "").trim().toUpperCase();
+  return SESSION_CODE_RE.test(cleaned) ? cleaned : null;
+}
+
+function belongsToSession(session, socketId) {
+  return session.hostId === socketId || session.guestId === socketId;
+}
+
+function getPeerSocketId(session, callerSocketId) {
+  const peerId = session.hostId === callerSocketId ? session.guestId : session.hostId;
+  return peerId || null;
+}
+
+function ackOf(callback) {
+  return typeof callback === "function" ? callback : () => {};
 }
 
 function endSession(code, reason) {
@@ -39,20 +67,11 @@ function endSession(code, reason) {
   console.log(`Session ${code} ended (${reason || "closed"})`);
 }
 
-// Given a session and the socket id of whoever is calling, returns the id of
-// the *other* device in that session (or null if there isn't one / it's not
-// currently connected).
-function getPeerSocketId(session, callerSocketId) {
-  const peerId = session.hostId === callerSocketId ? session.guestId : session.hostId;
-  return peerId || null;
-}
-
 io.on("connection", (socket) => {
   console.log("Device connected:", socket.id);
 
   socket.on("create-session", () => {
     let code = generateCode();
-
     while (sessions[code]) {
       code = generateCode();
     }
@@ -67,12 +86,16 @@ io.on("connection", (socket) => {
 
     socket.join(code);
     socket.emit("session-created", code);
-
     console.log(`${socket.id} created session ${code}`);
   });
 
   socket.on("join-session", (code) => {
-    const cleanedCode = String(code).trim().toUpperCase();
+    const cleanedCode = parseSessionCode(code);
+    if (!cleanedCode) {
+      socket.emit("join-error", "Enter a valid 6-character channel code.");
+      return;
+    }
+
     const session = sessions[cleanedCode];
 
     if (!session) {
@@ -81,10 +104,7 @@ io.on("connection", (socket) => {
     }
 
     if (session.hostId === socket.id) {
-      socket.emit(
-        "join-error",
-        "You already created this session. Join from another device."
-      );
+      socket.emit("join-error", "You already created this session. Join from another device.");
       return;
     }
 
@@ -99,76 +119,62 @@ io.on("connection", (socket) => {
 
     socket.emit("join-success", cleanedCode);
     io.to(cleanedCode).emit("session-connected", cleanedCode);
-
     console.log(`${socket.id} joined session ${cleanedCode}`);
   });
 
- // ---------- WebRTC Signaling ----------
+  socket.on("call-user", ({ sessionCode, offer }) => {
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+    if (!session || !belongsToSession(session, socket.id) || !offer) return;
+    const peerId = getPeerSocketId(session, socket.id);
+    if (!peerId) return;
+    io.to(peerId).emit("incoming-call", { offer });
+  });
 
-socket.on("call-user", ({ sessionCode, offer }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
-  const session = sessions[cleanedCode];
+  socket.on("call-accepted", ({ sessionCode, answer }) => {
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+    if (!session || !belongsToSession(session, socket.id) || !answer) return;
+    const peerId = getPeerSocketId(session, socket.id);
+    if (!peerId) return;
+    io.to(peerId).emit("call-accepted", { answer });
+  });
 
-  if (!session) return;
+  socket.on("call-declined", ({ sessionCode }) => {
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+    if (!session || !belongsToSession(session, socket.id)) return;
+    const peerId = getPeerSocketId(session, socket.id);
+    if (!peerId) return;
+    io.to(peerId).emit("call-declined");
+  });
 
-  const peerId = getPeerSocketId(session, socket.id);
-  if (!peerId) return;
+  socket.on("call-ice-candidate", ({ sessionCode, candidate }) => {
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+    if (!session || !belongsToSession(session, socket.id) || !candidate) return;
+    const peerId = getPeerSocketId(session, socket.id);
+    if (!peerId) return;
+    io.to(peerId).emit("call-ice-candidate", { candidate });
+  });
 
-  io.to(peerId).emit("incoming-call", { offer });
-});
-
-socket.on("call-accepted", ({ sessionCode, answer }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
-  const session = sessions[cleanedCode];
-
-  if (!session) return;
-
-  const peerId = getPeerSocketId(session, socket.id);
-  if (!peerId) return;
-
-  io.to(peerId).emit("call-accepted", { answer });
-});
-
-socket.on("call-declined", ({ sessionCode }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
-  const session = sessions[cleanedCode];
-
-  if (!session) return;
-
-  const peerId = getPeerSocketId(session, socket.id);
-  if (!peerId) return;
-
-  io.to(peerId).emit("call-declined");
-});
-
-socket.on("call-ice-candidate", ({ sessionCode, candidate }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
-  const session = sessions[cleanedCode];
-
-  if (!session) return;
-
-  const peerId = getPeerSocketId(session, socket.id);
-  if (!peerId) return;
-
-  io.to(peerId).emit("call-ice-candidate", { candidate });
-});
-
-socket.on("call-ended", ({ sessionCode }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
-  const session = sessions[cleanedCode];
-
-  if (!session) return;
-
-  const peerId = getPeerSocketId(session, socket.id);
-  if (!peerId) return;
-
-  io.to(peerId).emit("call-ended");
-});
+  socket.on("call-ended", ({ sessionCode }) => {
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+    if (!session || !belongsToSession(session, socket.id)) return;
+    const peerId = getPeerSocketId(session, socket.id);
+    if (!peerId) return;
+    io.to(peerId).emit("call-ended");
+  });
 
   socket.on("rejoin-session", ({ sessionCode, role }) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
-    const session = sessions[cleanedCode];
+    const cleanedCode = parseSessionCode(sessionCode);
+    if (!cleanedCode) {
+      socket.emit("rejoin-error", "That channel is no longer available.");
+      return;
+    }
 
+    const session = sessions[cleanedCode];
     if (!session) {
       socket.emit("rejoin-error", "That channel is no longer available.");
       return;
@@ -207,29 +213,21 @@ socket.on("call-ended", ({ sessionCode }) => {
       peerOnline: role === "host" ? session.guestOnline : session.hostOnline,
     });
     socket.to(cleanedCode).emit("peer-reconnected");
-
     console.log(`${socket.id} rejoined session ${cleanedCode} as ${role}`);
   });
 
   socket.on("end-session", ({ sessionCode }) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
-    const session = sessions[cleanedCode];
-
-    if (!session) return;
-
-    const belongsToSession =
-      session.hostId === socket.id || session.guestId === socket.id;
-
-    if (!belongsToSession) return;
-
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+    if (!session || !belongsToSession(session, socket.id)) return;
     endSession(cleanedCode, "closed");
   });
 
   socket.on("send-message", ({ sessionCode, message, messageId }, callback) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
-    const cleanedMessage = String(message).trim();
-    const session = sessions[cleanedCode];
-    const ack = typeof callback === "function" ? callback : () => {};
+    const ack = ackOf(callback);
+    const cleanedCode = parseSessionCode(sessionCode);
+    const cleanedMessage = String(message ?? "").trim();
+    const session = cleanedCode ? sessions[cleanedCode] : null;
 
     if (!session) {
       ack({ ok: false, messageId, error: "Session not found." });
@@ -241,17 +239,17 @@ socket.on("call-ended", ({ sessionCode }) => {
       return;
     }
 
-    const belongsToSession =
-      session.hostId === socket.id || session.guestId === socket.id;
+    if (cleanedMessage.length > MAX_MESSAGE_CHARS) {
+      ack({ ok: false, messageId, error: "Message is too long." });
+      return;
+    }
 
-    if (!belongsToSession) {
+    if (!belongsToSession(session, socket.id)) {
       ack({ ok: false, messageId, error: "You are not part of this session." });
       return;
     }
 
-    const peerOnline =
-      session.hostId === socket.id ? session.guestOnline : session.hostOnline;
-
+    const peerOnline = session.hostId === socket.id ? session.guestOnline : session.hostOnline;
     if (!peerOnline) {
       ack({ ok: false, messageId, error: "Peer is not connected." });
       return;
@@ -259,162 +257,126 @@ socket.on("call-ended", ({ sessionCode }) => {
 
     socket.to(cleanedCode).emit("receive-message", cleanedMessage);
     ack({ ok: true, messageId });
-
-    console.log(`Message sent in ${cleanedCode}: ${cleanedMessage}`);
+    console.log(`Message sent in ${cleanedCode} (${cleanedMessage.length} chars)`);
   });
 
   socket.on("typing", ({ sessionCode }) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
-    const session = sessions[cleanedCode];
-
-    if (!session) return;
-
-    const belongsToSession =
-      session.hostId === socket.id || session.guestId === socket.id;
-
-    if (!belongsToSession) return;
-
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+    if (!session || !belongsToSession(session, socket.id)) return;
     socket.to(cleanedCode).emit("peer-typing");
   });
 
   socket.on("stop-typing", ({ sessionCode }) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
-    const session = sessions[cleanedCode];
-
-    if (!session) return;
-
-    const belongsToSession =
-      session.hostId === socket.id || session.guestId === socket.id;
-
-    if (!belongsToSession) return;
-
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+    if (!session || !belongsToSession(session, socket.id)) return;
     socket.to(cleanedCode).emit("peer-stop-typing");
   });
 
-  // --- File transfer relay ---
-  // Mirrors the send-message pattern: validate the caller belongs to the
-  // session, then forward the event to the other device untouched. Chunks
-  // get acked back to the *sender* only after the *receiver* has actually
-  // acked them, so the client's chunk-by-chunk backpressure/progress logic
-  // reflects real delivery, not just "the server accepted it."
-
   socket.on(
     "file-transfer-start",
-    (
-      {
-        sessionCode,
+    ({ sessionCode, transferId, name, size, mimeType, totalChunks, kind, durationMs }, callback) => {
+      const ack = ackOf(callback);
+      const cleanedCode = parseSessionCode(sessionCode);
+      const session = cleanedCode ? sessions[cleanedCode] : null;
+
+      if (!session || !belongsToSession(session, socket.id)) {
+        ack({ ok: false, error: "Session not found." });
+        return;
+      }
+
+      const peerOnline = session.hostId === socket.id ? session.guestOnline : session.hostOnline;
+      if (!peerOnline) {
+        ack({ ok: false, error: "Peer is not connected." });
+        return;
+      }
+
+      const fileName = String(name ?? "").slice(0, MAX_FILENAME_CHARS);
+      const fileSize = Number(size);
+      const chunks = Number(totalChunks);
+
+      if (!transferId || !fileName || !Number.isFinite(fileSize) || fileSize < 0 || fileSize > MAX_FILE_BYTES) {
+        ack({ ok: false, error: "Invalid file." });
+        return;
+      }
+
+      if (!Number.isInteger(chunks) || chunks < 1 || chunks > 2000) {
+        ack({ ok: false, error: "Invalid transfer." });
+        return;
+      }
+
+      if (kind && !ALLOWED_KINDS.has(kind)) {
+        ack({ ok: false, error: "Invalid kind." });
+        return;
+      }
+
+      socket.to(cleanedCode).emit("file-transfer-start", {
         transferId,
-        name,
-        size,
+        fileName,
+        fileSize,
         mimeType,
-        totalChunks,
+        totalChunks: chunks,
         kind,
         durationMs,
-      },
-      callback
-    ) => {
-
-      const cleanedCode = String(sessionCode).trim().toUpperCase();
-      const session = sessions[cleanedCode];
-
-      if (!session) return;
-
-      const belongsToSession =
-        session.hostId === socket.id || session.guestId === socket.id;
-
-      if (!belongsToSession) return;
-
-      const peerOnline =
-        session.hostId === socket.id ? session.guestOnline : session.hostOnline;
-
-      if (!peerOnline) return;
-
-      socket
-  .to(cleanedCode)
-  .emit("file-transfer-start", {
-    transferId,
-    fileName: name,
-    fileSize: size,
-    mimeType,
-    totalChunks,
-    kind,
-    durationMs,
-  });
-        console.log(
-          `File transfer started in ${cleanedCode}: "${name}" (${size} bytes, ${totalChunks} chunks)`
-        );
-        
-        callback?.({ ok: true });
-    }
-  );
-
-  socket.on(
-    "file-transfer-chunk",
-    ({ sessionCode, transferId, index, data }, callback) => {
-      const cleanedCode = String(sessionCode).trim().toUpperCase();
-      const session = sessions[cleanedCode];
-      const ack = typeof callback === "function" ? callback : () => {};
-
-      if (!session) {
-        ack({ ok: false });
-        return;
-      }
-
-      const belongsToSession =
-        session.hostId === socket.id || session.guestId === socket.id;
-
-      if (!belongsToSession) {
-        ack({ ok: false });
-        return;
-      }
-
-      const peerId = getPeerSocketId(session, socket.id);
-      const peerSocket = peerId ? io.sockets.sockets.get(peerId) : null;
-
-      if (!peerSocket) {
-        ack({ ok: false });
-        return;
-      }
-
-      // Direct socket-to-socket emit (not a room broadcast) so we can use a
-      // real acknowledgement callback: room/broadcast emits in socket.io
-      // don't support acks the way a single socket.emit(event, data, cb) does.
-      peerSocket.emit("file-transfer-chunk", { transferId, index, data }, (peerAck) => {
-        ack(peerAck && peerAck.ok ? { ok: true } : { ok: false });
       });
+
+      console.log(`File transfer started in ${cleanedCode}: "${fileName}" (${fileSize} bytes, ${chunks} chunks)`);
+      ack({ ok: true });
     }
   );
 
-  socket.on(
-    "file-transfer-end",
-    ({ sessionCode, transferId }, callback) => {
-      const cleanedCode = String(sessionCode).trim().toUpperCase();
-      const session = sessions[cleanedCode];
-      const ack = typeof callback === "function" ? callback : () => {};
-  
-      if (!session) {
-        ack({ ok: false, error: "Session not found" });
-        return;
-      }
-  
-      const belongsToSession =
-        session.hostId === socket.id || session.guestId === socket.id;
-  
-      if (!belongsToSession) {
-        ack({ ok: false, error: "Not part of this session" });
-        return;
-      }
-  
-      socket.to(cleanedCode).emit("file-transfer-end", { transferId });
-  
-      ack({ ok: true });
-  
-      console.log(
-        `File transfer finished in ${cleanedCode}: ${transferId}`
-      );
+  socket.on("file-transfer-chunk", ({ sessionCode, transferId, index, data }, callback) => {
+    const ack = ackOf(callback);
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+
+    if (!session || !belongsToSession(session, socket.id) || !transferId || typeof data !== "string") {
+      ack({ ok: false });
+      return;
     }
 
-);
+    if (data.length > MAX_CHUNK_CHARS) {
+      ack({ ok: false });
+      return;
+    }
+
+    if (!Number.isInteger(index) || index < 0) {
+      ack({ ok: false });
+      return;
+    }
+
+    const peerId = getPeerSocketId(session, socket.id);
+    const peerSocket = peerId ? io.sockets.sockets.get(peerId) : null;
+    if (!peerSocket) {
+      ack({ ok: false });
+      return;
+    }
+
+    peerSocket.emit("file-transfer-chunk", { transferId, index, data }, (peerAck) => {
+      ack(peerAck && peerAck.ok ? { ok: true } : { ok: false });
+    });
+  });
+
+  socket.on("file-transfer-end", ({ sessionCode, transferId }, callback) => {
+    const ack = ackOf(callback);
+    const cleanedCode = parseSessionCode(sessionCode);
+    const session = cleanedCode ? sessions[cleanedCode] : null;
+
+    if (!session) {
+      ack({ ok: false, error: "Session not found" });
+      return;
+    }
+
+    if (!belongsToSession(session, socket.id) || !transferId) {
+      ack({ ok: false, error: "Not part of this session" });
+      return;
+    }
+
+    socket.to(cleanedCode).emit("file-transfer-end", { transferId });
+    ack({ ok: true });
+    console.log(`File transfer finished in ${cleanedCode}: ${transferId}`);
+  });
 
   socket.on("disconnect", () => {
     console.log("Device disconnected:", socket.id);
@@ -426,7 +388,6 @@ socket.on("call-ended", ({ sessionCode }) => {
         session.hostOnline = false;
 
         if (!session.guestId) {
-          // No one ever joined — just clean up immediately.
           endSession(code, "closed");
           break;
         }
@@ -440,7 +401,6 @@ socket.on("call-ended", ({ sessionCode }) => {
 
       if (session.guestId === socket.id && session.guestOnline) {
         session.guestOnline = false;
-
         socket.to(code).emit("peer-offline");
         session.timers.guest = setTimeout(() => {
           endSession(code, "timeout");
@@ -455,6 +415,10 @@ app.get("/", (req, res) => {
   res.send("ConnectionApp server is running.");
 });
 
-server.listen(3000, "0.0.0.0", () => {
-  console.log("Server running on port 3000");
+app.get("/health", (req, res) => {
+  res.json({ ok: true, sessions: Object.keys(sessions).length });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
 });

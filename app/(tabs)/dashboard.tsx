@@ -15,6 +15,8 @@ import { useRouter } from "expo-router";
 
 import { DashboardColors as C, DashboardRadii as R, mono } from "@/constants/dashboard-theme";
 import { socket } from "@/constants/socket";
+import { useWideLayout } from "@/hooks/use-wide-layout";
+import { useSessionSnapshot } from "@/lib/session-store";
 
 // ---- Types -----------------------------------------------------------
 
@@ -63,11 +65,10 @@ function deviceLabel() {
 
 export default function DashboardScreen() {
   const router = useRouter();
+  const { wide, maxContentWidth } = useWideLayout();
+  const session = useSessionSnapshot();
 
-  const [connected, setConnected] = useState(socket.connected);
   const [feed, setFeed] = useState<FeedEntry[]>([]);
-  const [sessionCode, setSessionCode] = useState<string | null>(null);
-  const [peerConnected, setPeerConnected] = useState(false);
   const startedAt = useRef(Date.now());
   const [uptimeLabel, setUptimeLabel] = useState("0m");
 
@@ -76,36 +77,38 @@ export default function DashboardScreen() {
   }
 
   useEffect(() => {
-    // Reflects the real shared socket — the same connection the Connect
-    // screen uses — rather than a separate, disconnected "demo" status.
     function onConnect() {
-      setConnected(true);
       pushFeed("Connected to server", "good");
     }
     function onDisconnect() {
-      setConnected(false);
       pushFeed("Disconnected from server", "bad");
     }
     function onSessionCreated(code: string) {
-      setSessionCode(code);
       pushFeed(`Channel ${code} created`, "good");
     }
     function onJoinSuccess(code: string) {
-      setSessionCode(code);
       pushFeed(`Joined channel ${code}`, "good");
     }
     function onSessionConnected() {
-      setPeerConnected(true);
       pushFeed("Peer connected", "good");
     }
     function onReceiveMessage() {
       pushFeed("Message received", "info");
+    }
+    function onIncomingCall() {
+      pushFeed("Incoming voice call", "info");
     }
     function onCallAccepted() {
       pushFeed("Voice call started", "info");
     }
     function onCallEnded() {
       pushFeed("Voice call ended", "info");
+    }
+    function onPeerOffline() {
+      pushFeed("Peer went offline", "bad");
+    }
+    function onSessionEnded() {
+      pushFeed("Channel ended", "bad");
     }
 
     socket.on("connect", onConnect);
@@ -114,8 +117,11 @@ export default function DashboardScreen() {
     socket.on("join-success", onJoinSuccess);
     socket.on("session-connected", onSessionConnected);
     socket.on("receive-message", onReceiveMessage);
+    socket.on("incoming-call", onIncomingCall);
     socket.on("call-accepted", onCallAccepted);
     socket.on("call-ended", onCallEnded);
+    socket.on("peer-offline", onPeerOffline);
+    socket.on("session-ended", onSessionEnded);
 
     return () => {
       socket.off("connect", onConnect);
@@ -124,8 +130,11 @@ export default function DashboardScreen() {
       socket.off("join-success", onJoinSuccess);
       socket.off("session-connected", onSessionConnected);
       socket.off("receive-message", onReceiveMessage);
+      socket.off("incoming-call", onIncomingCall);
       socket.off("call-accepted", onCallAccepted);
       socket.off("call-ended", onCallEnded);
+      socket.off("peer-offline", onPeerOffline);
+      socket.off("session-ended", onSessionEnded);
     };
   }, []);
 
@@ -139,17 +148,34 @@ export default function DashboardScreen() {
     return () => clearInterval(id);
   }, []);
 
+  const connected = session.connected;
+  const sessionCode = session.sessionCode;
+  const peerConnected = session.peerOnline;
   const statusText = connected ? "SERVER LINKED" : "REACHING SERVER";
   const statusColor = connected ? C.accent : C.warning;
+  const callLabel =
+    session.callState === "connected"
+      ? "In call"
+      : session.callState === "calling"
+        ? "Calling"
+        : session.callState === "ringing"
+          ? "Ringing"
+          : "Idle";
 
   return (
-    <ScrollView style={styles.screen} contentContainerStyle={styles.content}>
+    <ScrollView
+      style={styles.screen}
+      contentContainerStyle={[
+        styles.content,
+        wide && { maxWidth: maxContentWidth, width: "100%", alignSelf: "center" },
+      ]}
+    >
       {/* Header */}
       <View style={styles.header}>
         <View style={styles.brandRow}>
           <Feather name="activity" size={18} color={C.accent} />
           <View style={{ marginLeft: 10 }}>
-            <Text style={styles.brandTitle}>FIELD LINK</Text>
+            <Text style={styles.brandTitle}>CONNECTIONAPP</Text>
             <Text style={styles.brandSubtitle}>CONTROL CENTER</Text>
           </View>
         </View>
@@ -176,7 +202,7 @@ export default function DashboardScreen() {
           </View>
         </View>
 
-        <Pressable style={styles.primaryButton} onPress={() => router.push("/")}>
+        <Pressable style={styles.primaryButton} onPress={() => router.push(`/?intent=create&t=${Date.now()}`)}>
           <Feather name="plus" size={16} color={C.bg} />
           <View style={{ marginLeft: 10 }}>
             <Text style={styles.primaryButtonText}>CREATE CHANNEL</Text>
@@ -221,14 +247,14 @@ export default function DashboardScreen() {
           <Text style={styles.statSub}>{sessionCode ?? "Not connected"}</Text>
         </View>
         <View style={styles.statCard}>
-          <Text style={styles.statLabel}>SESSION UPTIME</Text>
-          <Text style={styles.statValue}>{uptimeLabel}</Text>
-          <Text style={styles.statSub}>Since app opened</Text>
+          <Text style={styles.statLabel}>MESSAGES</Text>
+          <Text style={styles.statValue}>{session.messageCount}</Text>
+          <Text style={styles.statSub}>{session.fileCount} file transfers</Text>
         </View>
         <View style={styles.statCard}>
-          <Text style={styles.statLabel}>TRANSPORT</Text>
-          <Text style={styles.statValue}>WebSocket</Text>
-          <Text style={styles.statSub}>socket.io</Text>
+          <Text style={styles.statLabel}>VOICE CALL</Text>
+          <Text style={styles.statValue}>{callLabel}</Text>
+          <Text style={styles.statSub}>{uptimeLabel} app uptime</Text>
         </View>
       </View>
 
@@ -408,6 +434,7 @@ const styles = StyleSheet.create({
   statCard: {
     flexBasis: "47%",
     flexGrow: 1,
+    minWidth: 140,
     backgroundColor: C.surface,
     borderWidth: 1,
     borderColor: C.border,

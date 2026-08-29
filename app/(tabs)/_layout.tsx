@@ -40,17 +40,10 @@ export default function TabLayout() {
           tabBarIcon: ({ color }) => (
             <IconSymbol
               size={26}
-              name="house.fill"
+              name="link"
               color={color}
             />
           ),
-        }}
-      />
-
-      <Tabs.Screen
-        name="explore"
-        options={{
-          href: null,
         }}
       />
     </Tabs>

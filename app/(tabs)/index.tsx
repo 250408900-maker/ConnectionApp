@@ -14,28 +14,27 @@ import {
   View,
 } from "react-native";
 
+import { Feather } from "@expo/vector-icons";
 import { Audio } from "expo-av";
 import * as Clipboard from "expo-clipboard";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
+import { useLocalSearchParams } from "expo-router";
 import * as Sharing from "expo-sharing";
-import { io } from "socket.io-client";
 
 import {
   DashboardColors as C,
   DashboardRadii as R,
 } from "@/constants/dashboard-theme";
-
-const SERVER_URL = "http://130.61.28.42:3000";
-
-const socket = io(SERVER_URL, {
-  transports: ["websocket"],
-  reconnection: true,
-  reconnectionAttempts: 5,
-  reconnectionDelay: 1000,
-  reconnectionDelayMax: 5000,
-});
+import { socket } from "@/constants/socket";
+import { useWideLayout } from "@/hooks/use-wide-layout";
+import {
+  bumpFileCount,
+  bumpMessageCount,
+  patchSession,
+  resetChannelState,
+} from "@/lib/session-store";
 // ---- WebRTC platform shim ----
 // react-native-webrtc is a native module and cannot run on web. On web we
 // use the browser's built-in WebRTC globals instead. On native we lazily
@@ -119,12 +118,12 @@ const STATUS_COPY: Record<LinkState, string> = {
   online: "SERVER LINKED",
   opening: "OPENING CHANNEL",
   waiting: "CHANNEL OPEN — WAITING FOR PEER",
-  tuning: "TUNING IN",
+  tuning: "JOINING CHANNEL",
   paired: "CHANNEL PAIRED",
   reconnecting: "RECONNECTING...",
   lost: "CONNECTION LOST",
   closed: "PEER SIGNED OFF",
-  error: "COULD NOT TUNE IN",
+  error: "COULD NOT JOIN",
 };
 
 const SIGNAL_LEVEL: Record<LinkState, number> = {
@@ -243,7 +242,23 @@ function AnimatedPressable({
   );
 }
 
+function emitAck<T>(event: string, payload: object, timeoutMs = 20000): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(undefined), timeoutMs);
+    socket.emit(event, payload, (response: T) => {
+      clearTimeout(timer);
+      resolve(response);
+    });
+  });
+}
+
 export default function HomeScreen() {
+  const { wide, maxContentWidth } = useWideLayout();
+  const params = useLocalSearchParams<{ intent?: string | string[]; t?: string | string[] }>();
+  const intent = Array.isArray(params.intent) ? params.intent[0] : params.intent;
+  const intentStamp = Array.isArray(params.t) ? params.t[0] : params.t;
+  const lastCreateStamp = useRef<string | null>(null);
+
   const [sessionCode, setSessionCode] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [linkState, setLinkState] = useState<LinkState>("connecting");
@@ -410,6 +425,7 @@ export default function HomeScreen() {
       setPeerTyping(false);
       roleRef.current = null;
       incomingTransfersRef.current = {};
+      resetChannelState();
       cleanupCall();
     }
 
@@ -453,6 +469,14 @@ export default function HomeScreen() {
       setMessages([]);
       setPeerOnline(false);
       setPeerTyping(false);
+      patchSession({
+        sessionCode: code,
+        role: "host",
+        peerOnline: false,
+        messageCount: 0,
+        fileCount: 0,
+        callState: "idle",
+      });
       logActivity(`Channel created: ${code}`, "good");
     }
 
@@ -462,11 +486,18 @@ export default function HomeScreen() {
       setLinkState("paired");
       setMessages([]);
       setPeerTyping(false);
-      logActivity(`Tuned in to channel ${code}`, "good");
+      patchSession({
+        sessionCode: code,
+        role: "guest",
+        messageCount: 0,
+        fileCount: 0,
+        callState: "idle",
+      });
+      logActivity(`Joined channel ${code}`, "good");
     }
 
     function handleJoinError(errorMessage: string) {
-      Alert.alert("Could not tune in", errorMessage);
+      Alert.alert("Could not join", errorMessage);
       setLinkState("error");
       logActivity(`Join failed: ${errorMessage}`, "bad");
     }
@@ -474,6 +505,7 @@ export default function HomeScreen() {
     function handleSessionConnected() {
       setLinkState("paired");
       setPeerOnline(true);
+      patchSession({ peerOnline: true });
       logActivity("Peer joined the channel", "good");
     }
 
@@ -481,6 +513,7 @@ export default function HomeScreen() {
       setSessionCode(payload.sessionCode);
       setLinkState("paired");
       setPeerOnline(payload.peerOnline);
+      patchSession({ sessionCode: payload.sessionCode, peerOnline: payload.peerOnline });
       logActivity("Rejoined channel after reconnect", "good");
     }
 
@@ -494,11 +527,13 @@ export default function HomeScreen() {
     function handlePeerOffline() {
       setPeerOnline(false);
       setPeerTyping(false);
+      patchSession({ peerOnline: false });
       logActivity("Peer went offline", "bad");
     }
 
     function handlePeerReconnected() {
       setPeerOnline(true);
+      patchSession({ peerOnline: true });
       logActivity("Peer reconnected", "good");
     }
 
@@ -513,6 +548,7 @@ export default function HomeScreen() {
 
       setPeerTyping(false);
       setMessages((current) => [...current, newMessage]);
+      bumpMessageCount();
       logActivity(`Received: "${truncatePreview(receivedMessage)}"`, "info");
       playNotificationSound();
     }
@@ -559,21 +595,30 @@ export default function HomeScreen() {
       logActivity(`Receiving ${payload.kind}: ${payload.fileName}`, "info");
     }
 
-    function handleFileTransferChunk(payload: {
-      transferId: string;
-      chunkIndex: number;
-      data: string;
-    }) {
+    function handleFileTransferChunk(
+      payload: {
+        transferId: string;
+        index?: number;
+        chunkIndex?: number;
+        data: string;
+      },
+      ack?: (response: { ok: boolean }) => void
+    ) {
       const transfer = incomingTransfersRef.current[payload.transferId];
-      if (!transfer) return;
+      const chunkIndex = payload.index ?? payload.chunkIndex;
+      if (!transfer || chunkIndex === undefined) {
+        ack?.({ ok: false });
+        return;
+      }
 
-      transfer.chunks[payload.chunkIndex] = payload.data;
+      transfer.chunks[chunkIndex] = payload.data;
       transfer.received += 1;
 
       const progress = Math.round((transfer.received / transfer.totalChunks) * 100);
       setMessages((current) =>
         current.map((m) => (m.id === transfer.messageId ? { ...m, progress } : m))
       );
+      ack?.({ ok: true });
     }
 
     async function handleFileTransferEnd(payload: { transferId: string }) {
@@ -607,6 +652,7 @@ export default function HomeScreen() {
       }
 
       logActivity(`Received ${transfer.kind}: ${transfer.fileName}`, "good");
+      bumpFileCount();
       playNotificationSound();
     }
 
@@ -635,6 +681,7 @@ export default function HomeScreen() {
       }
       incomingOfferRef.current = payload.offer;
       setCallState("ringing");
+      patchSession({ callState: "ringing" });
       setIncomingCall(true);
       logActivity("Incoming call", "info");
       playNotificationSound();
@@ -646,6 +693,7 @@ export default function HomeScreen() {
       await pc.setRemoteDescription(new RTCSessionDescription(payload.answer));
       await flushPendingCandidates(pc);
       setCallState("connected");
+      patchSession({ callState: "connected" });
       logActivity("Call connected", "good");
     }
 
@@ -743,6 +791,13 @@ export default function HomeScreen() {
     setLinkState("opening");
   }
 
+  useEffect(() => {
+    if (intent !== "create" || !intentStamp) return;
+    if (lastCreateStamp.current === intentStamp) return;
+    lastCreateStamp.current = intentStamp;
+    createSession();
+  }, [intent, intentStamp]);
+
   function joinSession() {
     const cleanedCode = joinCode.trim().toUpperCase();
 
@@ -802,7 +857,7 @@ export default function HomeScreen() {
 
     pc.addEventListener("icecandidate", (event: any) => {
       if (event.candidate) {
-        socket.emit("call-ice-candidate", { sessionCode, candidate: event.candidate });
+        socket.emit("call-ice-candidate", { sessionCode: sessionCodeRef.current, candidate: event.candidate });
       }
     });
 
@@ -856,6 +911,7 @@ export default function HomeScreen() {
     }
 
     setCallState("idle");
+    patchSession({ callState: "idle" });
     setCallSeconds(0);
     setIsMuted(false);
     setIncomingCall(false);
@@ -879,6 +935,7 @@ export default function HomeScreen() {
       await pc.setLocalDescription(offer);
 
       setCallState("calling");
+      patchSession({ callState: "calling" });
       socket.emit("call-user", { sessionCode, offer });
       logActivity("Calling peer...", "info");
     } catch (error) {
@@ -908,6 +965,7 @@ export default function HomeScreen() {
       socket.emit("call-accepted", { sessionCode, answer });
       setIncomingCall(false);
       setCallState("connected");
+      patchSession({ callState: "connected" });
       logActivity("Call connected", "good");
     } catch (error) {
       console.warn("acceptCall failed", error);
@@ -999,6 +1057,7 @@ export default function HomeScreen() {
         );
 
         if (response.ok) {
+          bumpMessageCount();
           logActivity(`Sent: "${truncatePreview(text)}"`, "good");
         } else {
           logActivity(`Message failed to send: "${truncatePreview(text)}"`, "bad");
@@ -1124,67 +1183,70 @@ export default function HomeScreen() {
       setMessages((current) => [...current, localMessage]);
       logActivity(`Sending ${kind}: ${fileName}`, "info");
 
-      socket.emit(
-        "file-transfer-start",
-        {
-          transferId,
-          sessionCode,
-          name: fileName,
-          size: fileSize,
-          mimeType,
-          totalChunks,
-          kind,
-          durationMs,
-        },
-        (response: { ok: boolean; error?: string }) => {
-          console.log("START ACK:", response);
-        }
-      );
+      const start = await emitAck<{ ok: boolean; error?: string }>("file-transfer-start", {
+        transferId,
+        sessionCode,
+        name: fileName,
+        size: fileSize,
+        mimeType,
+        totalChunks,
+        kind,
+        durationMs,
+      });
+
+      if (!start?.ok) {
+        setMessages((current) =>
+          current.map((m) => (m.id === transferId ? { ...m, status: "failed" } : m))
+        );
+        logActivity(`Failed to start transfer: ${fileName}`, "bad");
+        return;
+      }
 
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
         const chunk = base64.slice(chunkIndex * CHUNK_SIZE, (chunkIndex + 1) * CHUNK_SIZE);
 
-        socket.emit(
-          "file-transfer-chunk",
-          {
-            transferId,
-            sessionCode,
-            index: chunkIndex,
-            data: chunk,
-          },
-          (response: { ok: boolean }) => {
-            console.log("CHUNK ACK:", response);
-          }
-        );
+        const chunkAck = await emitAck<{ ok: boolean }>("file-transfer-chunk", {
+          transferId,
+          sessionCode,
+          index: chunkIndex,
+          data: chunk,
+        });
+
+        if (!chunkAck?.ok) {
+          setMessages((current) =>
+            current.map((m) => (m.id === transferId ? { ...m, status: "failed", progress: Math.round(((chunkIndex + 1) / totalChunks) * 100) } : m))
+          );
+          logActivity(`Failed to send ${fileName}`, "bad");
+          return;
+        }
 
         const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
-
         setMessages((current) => current.map((m) => (m.id === transferId ? { ...m, progress } : m)));
       }
 
-      socket.emit(
-        "file-transfer-end",
-        { transferId, sessionCode },
-        (response: { ok: boolean; error?: string }) => {
-          setMessages((current) =>
-            current.map((m) =>
-              m.id === transferId
-                ? {
-                    ...m,
-                    status: response?.ok ? "delivered" : "failed",
-                    progress: 100,
-                  }
-                : m
-            )
-          );
+      const end = await emitAck<{ ok: boolean; error?: string }>("file-transfer-end", {
+        transferId,
+        sessionCode,
+      });
 
-          if (response?.ok) {
-            logActivity(`Sent ${kind}: ${fileName}`, "good");
-          } else {
-            logActivity(`Failed to send ${fileName}`, "bad");
-          }
-        }
+      setMessages((current) =>
+        current.map((m) =>
+          m.id === transferId
+            ? {
+                ...m,
+                status: end?.ok ? "delivered" : "failed",
+                progress: 100,
+              }
+            : m
+        )
       );
+
+      if (end?.ok) {
+        bumpFileCount();
+        logActivity(`Sent ${kind}: ${fileName}`, "good");
+      } else {
+        logActivity(`Failed to send ${fileName}`, "bad");
+      }
     } catch (error) {
       console.warn("sendAttachment failed", error);
       Alert.alert("Couldn't send that", "Something went wrong reading the file.");
@@ -1299,7 +1361,7 @@ export default function HomeScreen() {
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      mediaTypes: ["images"],
       quality: 0.7,
     });
 
@@ -1363,69 +1425,27 @@ export default function HomeScreen() {
 
   return (
     <View style={styles.container}>
+      <View style={[styles.inner, wide && { maxWidth: maxContentWidth, width: "100%", alignSelf: "center" }]}>
       {incomingCall && (
-        <View
-          style={{
-            position: "absolute",
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            backgroundColor: "rgba(0,0,0,0.9)",
-            justifyContent: "center",
-            alignItems: "center",
-            zIndex: 999,
-          }}
-        >
-          <Text
-            style={{
-              color: "#fff",
-              fontSize: 30,
-              fontWeight: "bold",
-              marginBottom: 10,
-            }}
-          >
-            📞 Incoming Call
-          </Text>
-
-          <Text
-            style={{
-              color: "#aaa",
-              marginBottom: 30,
-            }}
-          >
-            Your peer is calling...
-          </Text>
-
-          <Pressable
-            onPress={acceptCall}
-            style={{
-              backgroundColor: "#1db954",
-              paddingHorizontal: 30,
-              paddingVertical: 15,
-              borderRadius: 10,
-              marginBottom: 15,
-            }}
-          >
-            <Text style={{ color: "white", fontWeight: "bold" }}>Answer</Text>
-          </Pressable>
-
-          <Pressable
-            onPress={declineCall}
-            style={{
-              backgroundColor: "#d32f2f",
-              paddingHorizontal: 30,
-              paddingVertical: 15,
-              borderRadius: 10,
-            }}
-          >
-            <Text style={{ color: "white", fontWeight: "bold" }}>Decline</Text>
-          </Pressable>
+        <View style={styles.callOverlay}>
+          <View style={styles.callCard}>
+            <Feather name="phone-incoming" size={28} color={C.accent} />
+            <Text style={styles.callTitle}>Incoming call</Text>
+            <Text style={styles.callSubtitle}>Your peer wants to talk</Text>
+            <View style={styles.callActions}>
+              <Pressable onPress={acceptCall} style={styles.callAccept}>
+                <Text style={styles.callAcceptText}>Answer</Text>
+              </Pressable>
+              <Pressable onPress={declineCall} style={styles.callDecline}>
+                <Text style={styles.callDeclineText}>Decline</Text>
+              </Pressable>
+            </View>
+          </View>
         </View>
       )}
 
       <View style={styles.header}>
-        <Text style={styles.eyebrow}>PEER-TO-PEER • SHORT RANGE</Text>
+        <Text style={styles.eyebrow}>CONNECTIONAPP</Text>
 
         <View
           style={{
@@ -1434,10 +1454,10 @@ export default function HomeScreen() {
             justifyContent: "space-between",
           }}
         >
-          <Text style={styles.title}>Field Link</Text>
+          <Text style={styles.title}>Connect</Text>
 
-          <Pressable onPress={startCall} disabled={callState !== "idle"}>
-            <Text style={{ fontSize: 22, opacity: callState !== "idle" ? 0.4 : 1 }}>📞</Text>
+          <Pressable onPress={startCall} disabled={callState !== "idle"} style={styles.headerCallButton}>
+            <Feather name="phone" size={20} color={callState !== "idle" ? C.textFaint : C.accent} />
           </Pressable>
         </View>
       </View>
@@ -1489,7 +1509,7 @@ export default function HomeScreen() {
 
           <View style={styles.dividerRow}>
             <View style={styles.dividerLine} />
-            <Text style={styles.dividerText}>OR TUNE IN</Text>
+            <Text style={styles.dividerText}>OR JOIN</Text>
             <View style={styles.dividerLine} />
           </View>
 
@@ -1513,7 +1533,7 @@ export default function HomeScreen() {
           </View>
 
           <AnimatedPressable style={styles.secondaryButton} onPress={joinSession}>
-            <Text style={styles.secondaryButtonText}>Tune In</Text>
+            <Text style={styles.secondaryButtonText}>Join Channel</Text>
           </AnimatedPressable>
         </View>
       ) : (
@@ -1555,10 +1575,10 @@ export default function HomeScreen() {
                 {callState === "calling" ? "Calling…" : `On call ${formatElapsed(callSeconds)}`}
               </Text>
               <Pressable onPress={toggleMute} style={{ paddingHorizontal: 8 }}>
-                <Text style={{ color: "#EDE9DC", fontSize: 16 }}>{isMuted ? "🔇" : "🎙️"}</Text>
+                <Feather name={isMuted ? "mic-off" : "mic"} size={16} color={C.text} />
               </Pressable>
               <Pressable onPress={endCall} style={{ paddingHorizontal: 8 }}>
-                <Text style={{ color: "#E0645A", fontFamily: mono, fontSize: 12 }}>📞 End</Text>
+                <Text style={{ color: C.danger, fontFamily: mono, fontSize: 12 }}>End</Text>
               </Pressable>
             </View>
           ) : null}
@@ -1734,6 +1754,7 @@ export default function HomeScreen() {
           ) : null}
         </Pressable>
       </Modal>
+      </View>
     </View>
   );
 }
@@ -1752,9 +1773,13 @@ function SignalBars({ level }: { level: number }) {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    backgroundColor: C.bg,
+  },
+
+  inner: {
+    flex: 1,
     padding: 24,
     paddingTop: 64,
-    backgroundColor: C.bg,
   },
 
   header: {
@@ -2424,5 +2449,84 @@ const styles = StyleSheet.create({
   viewerImage: {
     width: "100%",
     height: "80%",
+  },
+
+  headerCallButton: {
+    width: 44,
+    height: 44,
+    borderRadius: R.md,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.surface,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  callOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(5,7,10,0.92)",
+    justifyContent: "center",
+    alignItems: "center",
+    zIndex: 999,
+    padding: 24,
+  },
+
+  callCard: {
+    width: "100%",
+    maxWidth: 360,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: R.lg,
+    padding: 24,
+    alignItems: "center",
+    gap: 8,
+  },
+
+  callTitle: {
+    color: C.text,
+    fontSize: 22,
+    fontWeight: "700",
+    marginTop: 8,
+  },
+
+  callSubtitle: {
+    color: C.textMuted,
+    marginBottom: 16,
+  },
+
+  callActions: {
+    width: "100%",
+    gap: 10,
+  },
+
+  callAccept: {
+    backgroundColor: C.accent,
+    paddingVertical: 14,
+    borderRadius: R.md,
+    alignItems: "center",
+  },
+
+  callAcceptText: {
+    color: C.bg,
+    fontWeight: "700",
+  },
+
+  callDecline: {
+    backgroundColor: C.surfaceAlt,
+    borderWidth: 1,
+    borderColor: C.danger,
+    paddingVertical: 14,
+    borderRadius: R.md,
+    alignItems: "center",
+  },
+
+  callDeclineText: {
+    color: C.danger,
+    fontWeight: "700",
   },
 });
