@@ -22,6 +22,11 @@ import * as ImagePicker from "expo-image-picker";
 import * as Sharing from "expo-sharing";
 import { io } from "socket.io-client";
 
+import {
+  DashboardColors as C,
+  DashboardRadii as R,
+} from "@/constants/dashboard-theme";
+
 const SERVER_URL = "http://130.61.28.42:3000";
 
 const socket = io(SERVER_URL, {
@@ -1745,87 +1750,232 @@ function SignalBars({ level }: { level: number }) {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 24, paddingTop: 64, backgroundColor: "#14170F" },
-  header: { marginBottom: 24 },
-  eyebrow: { color: "#7C8570", fontSize: 11, letterSpacing: 2, fontFamily: mono, marginBottom: 6 },
-  title: { color: "#EDE9DC", fontSize: 30, fontWeight: "700", letterSpacing: 0.5 },
+  container: {
+    flex: 1,
+    padding: 24,
+    paddingTop: 64,
+    backgroundColor: C.bg,
+  },
+
+  header: {
+    marginBottom: 24,
+  },
+
+  eyebrow: {
+    color: C.textFaint,
+    fontSize: 11,
+    letterSpacing: 2,
+    fontFamily: mono,
+    marginBottom: 6,
+  },
+
+  title: {
+    color: C.text,
+    fontSize: 30,
+    fontWeight: "700",
+    letterSpacing: 0.5,
+  },
+
   statusRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    backgroundColor: "#1B2016",
+    backgroundColor: C.surface,
     borderWidth: 1,
-    borderColor: "#2B3122",
-    borderRadius: 8,
+    borderColor: C.border,
+    borderRadius: R.md,
     paddingVertical: 13,
     paddingHorizontal: 16,
     marginBottom: 14,
   },
-  statusRowLeft: { flexDirection: "row", alignItems: "center" },
-  statusDot: { width: 8, height: 8, borderRadius: 4, marginRight: 10 },
-  bars: { flexDirection: "row", alignItems: "flex-end", gap: 3, marginRight: 12 },
-  bar: { width: 4, borderRadius: 1 },
-  statusText: { color: "#B9C0AC", fontSize: 12, fontFamily: mono, letterSpacing: 0.5 },
-  logToggle: { color: "#7C8570", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
+
+  statusRowLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 10,
+  },
+
+  bars: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: 3,
+    marginRight: 12,
+  },
+
+  bar: {
+    width: 4,
+    borderRadius: 1,
+  },
+
+  statusText: {
+    color: C.textMuted,
+    fontSize: 12,
+    fontFamily: mono,
+    letterSpacing: 0.5,
+  },
+
+  logToggle: {
+    color: C.textFaint,
+    fontSize: 10,
+    fontFamily: mono,
+    letterSpacing: 1,
+  },
+
   logPanel: {
-    backgroundColor: "#171B12",
+    backgroundColor: C.surfaceAlt,
     borderWidth: 1,
-    borderColor: "#2B3122",
-    borderRadius: 8,
+    borderColor: C.border,
+    borderRadius: R.md,
     marginBottom: 18,
     paddingHorizontal: 14,
     paddingVertical: 12,
   },
-  logPanelEmpty: { color: "#5F6653", fontFamily: mono, fontSize: 12, textAlign: "center", paddingVertical: 8 },
-  logPanelScroll: { maxHeight: 150 },
-  logEntryRow: { flexDirection: "row", alignItems: "center", paddingVertical: 4, gap: 8 },
-  logEntryDot: { color: "#7C8570", fontSize: 8 },
-  logEntryDotGood: { color: "#5DCAA5" },
-  logEntryDotBad: { color: "#E0645A" },
-  logEntryTime: { color: "#5F6653", fontFamily: mono, fontSize: 10, width: 62 },
-  logEntryText: { color: "#B9C0AC", fontFamily: mono, fontSize: 11, flexShrink: 1 },
-  lobby: { flex: 1, justifyContent: "center" },
-  primaryButton: {
-    backgroundColor: "#C9A227",
-    paddingVertical: 17,
-    borderRadius: 8,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 4,
-    elevation: 3,
+
+  logPanelEmpty: {
+    color: C.textFaint,
+    fontFamily: mono,
+    fontSize: 12,
+    textAlign: "center",
+    paddingVertical: 8,
   },
-  primaryButtonText: { color: "#14170F", textAlign: "center", fontSize: 16, fontWeight: "700", letterSpacing: 0.3 },
-  dividerRow: { flexDirection: "row", alignItems: "center", marginVertical: 30 },
-  dividerLine: { flex: 1, height: 1, backgroundColor: "#2B3122" },
-  dividerText: { color: "#5F6653", fontSize: 11, fontFamily: mono, letterSpacing: 1.5, marginHorizontal: 12 },
-  dial: { marginBottom: 18 },
-  dialLabel: { color: "#7C8570", fontSize: 11, fontFamily: mono, letterSpacing: 1.5, marginBottom: 9 },
+
+  logPanelScroll: {
+    maxHeight: 150,
+  },
+
+  logEntryRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 4,
+    gap: 8,
+  },
+
+  logEntryDot: {
+    color: C.textFaint,
+    fontSize: 8,
+  },
+
+  logEntryDotGood: {
+    color: C.accent,
+  },
+
+  logEntryDotBad: {
+    color: C.danger,
+  },
+
+  logEntryTime: {
+    color: C.textFaint,
+    fontFamily: mono,
+    fontSize: 10,
+    width: 62,
+  },
+
+  logEntryText: {
+    color: C.textMuted,
+    fontFamily: mono,
+    fontSize: 11,
+    flexShrink: 1,
+  },
+
+  lobby: {
+    flex: 1,
+    justifyContent: "center",
+  },
+
+  primaryButton: {
+    backgroundColor: C.accent,
+    paddingVertical: 17,
+    borderRadius: R.md,
+  },
+
+  primaryButtonText: {
+    color: C.bg,
+    textAlign: "center",
+    fontSize: 16,
+    fontWeight: "700",
+    letterSpacing: 0.3,
+  },
+
+  dividerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    marginVertical: 30,
+  },
+
+  dividerLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: C.border,
+  },
+
+  dividerText: {
+    color: C.textFaint,
+    fontSize: 11,
+    fontFamily: mono,
+    letterSpacing: 1.5,
+    marginHorizontal: 12,
+  },
+
+  dial: {
+    marginBottom: 18,
+  },
+
+  dialLabel: {
+    color: C.textMuted,
+    fontSize: 11,
+    fontFamily: mono,
+    letterSpacing: 1.5,
+    marginBottom: 9,
+  },
+
   dialInput: {
-    backgroundColor: "#1B2016",
+    backgroundColor: C.surface,
     borderWidth: 1,
-    borderColor: "#2B3122",
-    borderRadius: 8,
-    color: "#EDE9DC",
+    borderColor: C.border,
+    borderRadius: R.md,
+    color: C.text,
     padding: 16,
     fontSize: 22,
     fontFamily: mono,
     textAlign: "center",
     letterSpacing: 6,
   },
-  secondaryButton: { borderWidth: 1, borderColor: "#C9A227", paddingVertical: 16, borderRadius: 8 },
-  secondaryButtonText: { color: "#C9A227", textAlign: "center", fontSize: 16, fontWeight: "600", letterSpacing: 0.3 },
-  session: { flex: 1 },
-  readout: {
-    backgroundColor: "#1B2016",
+
+  secondaryButton: {
     borderWidth: 1,
-    borderColor: "#2B3122",
-    borderRadius: 8,
+    borderColor: C.accent,
+    paddingVertical: 16,
+    borderRadius: R.md,
+  },
+
+  secondaryButtonText: {
+    color: C.accent,
+    textAlign: "center",
+    fontSize: 16,
+    fontWeight: "600",
+  },
+
+  session: {
+    flex: 1,
+  },
+
+  readout: {
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: R.md,
     paddingVertical: 16,
     paddingHorizontal: 18,
     alignItems: "center",
     marginBottom: 18,
   },
+
   readoutHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -1833,115 +1983,446 @@ const styles = StyleSheet.create({
     width: "100%",
     marginBottom: 12,
   },
-  readoutLabel: { color: "#7C8570", fontSize: 10, fontFamily: mono, letterSpacing: 2 },
-  peerDotRow: { flexDirection: "row", alignItems: "center", gap: 6 },
-  peerDot: { width: 6, height: 6, borderRadius: 3 },
-  peerDotLabel: { color: "#7C8570", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
-  timerText: { color: "#5F6653", fontFamily: mono, fontSize: 10 },
-  readoutDigits: { flexDirection: "row", gap: 6, marginBottom: 16 },
+
+  readoutLabel: {
+    color: C.textFaint,
+    fontSize: 10,
+    fontFamily: mono,
+    letterSpacing: 2,
+  },
+
+  peerDotRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+  },
+
+  peerDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+
+  peerDotLabel: {
+    color: C.textMuted,
+    fontSize: 10,
+    fontFamily: mono,
+    letterSpacing: 1,
+  },
+
+  timerText: {
+    color: C.textFaint,
+    fontFamily: mono,
+    fontSize: 10,
+  },
+
+  readoutDigits: {
+    flexDirection: "row",
+    gap: 6,
+    marginBottom: 16,
+  },
+
   digitCell: {
-    backgroundColor: "#14170F",
+    backgroundColor: C.bgElevated,
     borderWidth: 1,
-    borderColor: "#3A4033",
-    borderRadius: 5,
+    borderColor: C.border,
+    borderRadius: R.sm,
     width: 30,
     paddingVertical: 6,
     alignItems: "center",
   },
-  digitText: { color: "#C9A227", fontSize: 18, fontFamily: mono, fontWeight: "700" },
-  readoutActions: { flexDirection: "row", flexWrap: "wrap", justifyContent: "center", gap: 9 },
-  copyButton: { borderWidth: 1, borderColor: "#3A4033", borderRadius: 6, paddingVertical: 9, paddingHorizontal: 13 },
-  copyButtonText: { color: "#B9C0AC", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
-  clearButton: { borderWidth: 1, borderColor: "#3A4033", borderRadius: 6, paddingVertical: 9, paddingHorizontal: 13 },
-  clearButtonText: { color: "#B9C0AC", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
-  endButton: { borderWidth: 1, borderColor: "#4B2A2A", borderRadius: 6, paddingVertical: 9, paddingHorizontal: 13 },
-  endButtonText: { color: "#D4877A", fontSize: 10, fontFamily: mono, letterSpacing: 1 },
-  log: { flex: 1, backgroundColor: "#1B2016", borderWidth: 1, borderColor: "#2B3122", borderRadius: 8, marginBottom: 14 },
-  logContent: { padding: 16, flexGrow: 1 },
-  emptyState: { flex: 1, alignItems: "center", justifyContent: "center", paddingVertical: 40 },
-  emptyStateIcon: { fontSize: 28, marginBottom: 10, opacity: 0.6 },
-  emptyText: { color: "#8A9280", fontFamily: mono, fontSize: 14, textAlign: "center", fontWeight: "600" },
-  emptySubtext: { color: "#5F6653", fontFamily: mono, fontSize: 12, textAlign: "center", marginTop: 4 },
-  bubbleRow: { marginVertical: 6, flexDirection: "row" },
-  bubbleRowMe: { justifyContent: "flex-end" },
-  bubbleRowOther: { justifyContent: "flex-start" },
-  bubble: { maxWidth: "78%", borderRadius: 10, paddingVertical: 9, paddingHorizontal: 13 },
-  bubbleMe: { backgroundColor: "#26301F" },
-  bubbleOther: { backgroundColor: "#20241A" },
-  logText: { color: "#EDE9DC", fontSize: 15, flexShrink: 1, flexWrap: "wrap" },
-  imageThumb: { width: 200, height: 200, borderRadius: 8, backgroundColor: "#14170F" },
+
+  digitText: {
+    color: C.accent,
+    fontSize: 18,
+    fontFamily: mono,
+    fontWeight: "700",
+  },
+
+  readoutActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "center",
+    gap: 9,
+  },
+
+  copyButton: {
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: R.sm,
+    paddingVertical: 9,
+    paddingHorizontal: 13,
+  },
+
+  copyButtonText: {
+    color: C.textMuted,
+    fontSize: 10,
+    fontFamily: mono,
+    letterSpacing: 1,
+  },
+
+  clearButton: {
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: R.sm,
+    paddingVertical: 9,
+    paddingHorizontal: 13,
+  },
+
+  clearButtonText: {
+    color: C.textMuted,
+    fontSize: 10,
+    fontFamily: mono,
+    letterSpacing: 1,
+  },
+
+  endButton: {
+    borderWidth: 1,
+    borderColor: C.danger,
+    borderRadius: R.sm,
+    paddingVertical: 9,
+    paddingHorizontal: 13,
+  },
+
+  endButtonText: {
+    color: C.danger,
+    fontSize: 10,
+    fontFamily: mono,
+    letterSpacing: 1,
+  },
+
+  log: {
+    flex: 1,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: R.md,
+    marginBottom: 14,
+  },
+
+  logContent: {
+    padding: 16,
+    flexGrow: 1,
+  },
+
+  emptyState: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 40,
+  },
+
+  emptyStateIcon: {
+    fontSize: 28,
+    marginBottom: 10,
+    opacity: 0.6,
+  },
+
+  emptyText: {
+    color: C.textMuted,
+    fontFamily: mono,
+    fontSize: 14,
+    textAlign: "center",
+    fontWeight: "600",
+  },
+
+  emptySubtext: {
+    color: C.textFaint,
+    fontFamily: mono,
+    fontSize: 12,
+    textAlign: "center",
+    marginTop: 4,
+  },
+
+  bubbleRow: {
+    marginVertical: 6,
+    flexDirection: "row",
+  },
+
+  bubbleRowMe: {
+    justifyContent: "flex-end",
+  },
+
+  bubbleRowOther: {
+    justifyContent: "flex-start",
+  },
+
+  bubble: {
+    maxWidth: "78%",
+    borderRadius: R.md,
+    paddingVertical: 9,
+    paddingHorizontal: 13,
+  },
+
+  bubbleMe: {
+    backgroundColor: C.accentSoft,
+    borderWidth: 1,
+    borderColor: C.accentDim,
+  },
+
+  bubbleOther: {
+    backgroundColor: C.surfaceAlt,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+
+  logText: {
+    color: C.text,
+    fontSize: 15,
+    flexShrink: 1,
+    flexWrap: "wrap",
+  },
+
+  imageThumb: {
+    width: 200,
+    height: 200,
+    borderRadius: R.md,
+    backgroundColor: C.bgElevated,
+  },
+
   imagePlaceholder: {
     width: 200,
     height: 200,
-    borderRadius: 8,
-    backgroundColor: "#14170F",
+    borderRadius: R.md,
+    backgroundColor: C.bgElevated,
     alignItems: "center",
     justifyContent: "center",
   },
-  imagePlaceholderText: { color: "#7C8570", fontFamily: mono, fontSize: 12 },
-  voiceCard: { flexDirection: "row", alignItems: "center", gap: 12, minWidth: 190, paddingVertical: 4 },
-  voicePlayButton: { color: "#C9A227", fontSize: 22, width: 30, textAlign: "center" },
-  voiceInfo: { flex: 1 },
-  voiceLabel: { color: "#EDE9DC", fontSize: 12, fontFamily: mono, letterSpacing: 1 },
-  voiceDuration: { color: "#7C8570", fontSize: 11, fontFamily: mono, marginTop: 3 },
-  fileCard: { flexDirection: "row", alignItems: "center", gap: 10, minWidth: 180 },
-  fileGlyph: { fontSize: 26 },
-  fileCardInfo: { flexShrink: 1 },
-  fileCardName: { color: "#EDE9DC", fontSize: 14, fontFamily: mono },
-  fileCardSize: { color: "#7C8570", fontSize: 11, fontFamily: mono, marginTop: 2 },
+
+  imagePlaceholderText: {
+    color: C.textFaint,
+    fontFamily: mono,
+    fontSize: 12,
+  },
+
+  voiceCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    minWidth: 190,
+    paddingVertical: 4,
+  },
+
+  voicePlayButton: {
+    color: C.accent,
+    fontSize: 22,
+    width: 30,
+    textAlign: "center",
+  },
+
+  voiceInfo: {
+    flex: 1,
+  },
+
+  voiceLabel: {
+    color: C.text,
+    fontSize: 12,
+    fontFamily: mono,
+    letterSpacing: 1,
+  },
+
+  voiceDuration: {
+    color: C.textFaint,
+    fontSize: 11,
+    fontFamily: mono,
+    marginTop: 3,
+  },
+
+  fileCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    minWidth: 180,
+  },
+
+  fileGlyph: {
+    fontSize: 26,
+  },
+
+  fileCardInfo: {
+    flexShrink: 1,
+  },
+
+  fileCardName: {
+    color: C.text,
+    fontSize: 14,
+    fontFamily: mono,
+  },
+
+  fileCardSize: {
+    color: C.textFaint,
+    fontSize: 11,
+    fontFamily: mono,
+    marginTop: 2,
+  },
+
   progressTrack: {
     height: 4,
     borderRadius: 2,
-    backgroundColor: "#14170F",
+    backgroundColor: C.bgElevated,
     marginTop: 8,
     overflow: "hidden",
   },
-  progressFill: { height: 4, backgroundColor: "#C9A227" },
-  bubbleFooter: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 5, gap: 10 },
-  timeText: { color: "#5F6653", fontFamily: mono, fontSize: 10 },
-  statusText2: { color: "#5F6653", fontFamily: mono, fontSize: 10 },
-  statusFailed: { color: "#D4877A" },
-  typingText: { color: "#7C8570", fontFamily: mono, fontSize: 12, fontStyle: "italic", marginTop: 6 },
-  recordingBanner: { flexDirection: "row", alignItems: "center", gap: 8, marginBottom: 10, paddingHorizontal: 12, paddingVertical: 9, borderRadius: 8, backgroundColor: "#241817", borderWidth: 1, borderColor: "#4B2A2A" },
-  recordingDot: { color: "#E0645A", fontSize: 12 },
-  recordingText: { color: "#EDE9DC", fontFamily: mono, fontSize: 12, flex: 1 },
-  recordingHint: { color: "#7C8570", fontFamily: mono, fontSize: 10 },
-  sendRow: { flexDirection: "row", alignItems: "center", gap: 10 },
+
+  progressFill: {
+    height: 4,
+    backgroundColor: C.accent,
+  },
+
+  bubbleFooter: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: 5,
+    gap: 10,
+  },
+
+  timeText: {
+    color: C.textFaint,
+    fontFamily: mono,
+    fontSize: 10,
+  },
+
+  statusText2: {
+    color: C.textFaint,
+    fontFamily: mono,
+    fontSize: 10,
+  },
+
+  statusFailed: {
+    color: C.danger,
+  },
+
+  typingText: {
+    color: C.accent,
+    fontFamily: mono,
+    fontSize: 12,
+    fontStyle: "italic",
+    marginTop: 6,
+  },
+
+  recordingBanner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginBottom: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+    borderRadius: R.md,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.danger,
+  },
+
+  recordingDot: {
+    color: C.danger,
+    fontSize: 12,
+  },
+
+  recordingText: {
+    color: C.text,
+    fontFamily: mono,
+    fontSize: 12,
+    flex: 1,
+  },
+
+  recordingHint: {
+    color: C.textFaint,
+    fontFamily: mono,
+    fontSize: 10,
+  },
+
+  sendRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+
   attachButton: {
     width: 48,
     height: 48,
-    borderRadius: 8,
+    borderRadius: R.md,
     borderWidth: 1,
-    borderColor: "#2B3122",
-    backgroundColor: "#1B2016",
+    borderColor: C.border,
+    backgroundColor: C.surface,
     alignItems: "center",
     justifyContent: "center",
   },
-  micButton: { width: 48, height: 48, borderRadius: 8, borderWidth: 1, borderColor: "#2B3122", backgroundColor: "#1B2016", alignItems: "center", justifyContent: "center" },
-  micButtonRecording: { backgroundColor: "#4B2A2A", borderColor: "#E0645A" },
-  micButtonText: { fontSize: 18, color: "#EDE9DC" },
-  attachButtonDisabled: { opacity: 0.5 },
-  attachButtonText: { fontSize: 20 },
+
+  micButton: {
+    width: 48,
+    height: 48,
+    borderRadius: R.md,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.surface,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  micButtonRecording: {
+    backgroundColor: C.surface,
+    borderColor: C.danger,
+  },
+
+  micButtonText: {
+    fontSize: 18,
+    color: C.text,
+  },
+
+  attachButtonDisabled: {
+    opacity: 0.5,
+  },
+
+  attachButtonText: {
+    fontSize: 20,
+  },
+
   messageInput: {
     flex: 1,
-    backgroundColor: "#1B2016",
+    backgroundColor: C.surface,
     borderWidth: 1,
-    borderColor: "#2B3122",
-    borderRadius: 8,
-    color: "#EDE9DC",
+    borderColor: C.border,
+    borderRadius: R.md,
+    color: C.text,
     padding: 15,
     fontSize: 15,
     fontFamily: mono,
   },
-  messageInputDisabled: { opacity: 0.5 },
-  sendButton: { backgroundColor: "#C9A227", paddingVertical: 15, paddingHorizontal: 19, borderRadius: 8 },
-  sendButtonDisabled: { backgroundColor: "#4B4326" },
-  sendButtonText: { color: "#14170F", fontSize: 13, fontFamily: mono, fontWeight: "700", letterSpacing: 0.5 },
+
+  messageInputDisabled: {
+    opacity: 0.5,
+  },
+
+  sendButton: {
+    backgroundColor: C.accent,
+    paddingVertical: 15,
+    paddingHorizontal: 19,
+    borderRadius: R.md,
+  },
+
+  sendButtonDisabled: {
+    backgroundColor: C.accentDim,
+    opacity: 0.55,
+  },
+
+  sendButtonText: {
+    color: C.bg,
+    fontSize: 13,
+    fontFamily: mono,
+    fontWeight: "700",
+    letterSpacing: 0.5,
+  },
+
   viewerBackdrop: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.92)",
+    backgroundColor: "rgba(0,0,0,0.95)",
     alignItems: "center",
     justifyContent: "center",
   },
-  viewerImage: { width: "100%", height: "80%" },
+
+  viewerImage: {
+    width: "100%",
+    height: "80%",
+  },
 });
