@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
+    Alert,
+    FlatList,
     Platform,
     Pressable,
     ScrollView,
     StyleSheet,
     Text,
+    TextInput,
     View,
 } from "react-native";
 
@@ -16,6 +19,15 @@ import { useRouter } from "expo-router";
 import { DashboardColors as C, DashboardRadii as R, mono } from "@/constants/dashboard-theme";
 import { socket } from "@/constants/socket";
 import { setSharedSessionState, useSharedSessionState } from "@/constants/session-state";
+import {
+  clearFileHistory,
+  filterHistory,
+  formatHistorySize,
+  useFileHistory,
+  type FileCategory,
+  type FileDirection,
+  type FileHistoryStatus,
+} from "@/constants/file-history";
 
 // ---- Types -----------------------------------------------------------
 
@@ -69,6 +81,23 @@ export default function DashboardScreen() {
   const [feed, setFeed] = useState<FeedEntry[]>([]);
   const startedAt = useRef(Date.now());
   const [uptimeLabel, setUptimeLabel] = useState("0m");
+  const history = useFileHistory();
+  const [search, setSearch] = useState("");
+  const [category, setCategory] = useState<FileCategory | "All">("All");
+  const [direction, setDirection] = useState<FileDirection | "All">("All");
+  const [historyStatus, setHistoryStatus] = useState<FileHistoryStatus | "All">("All");
+  const filteredHistory = useMemo(
+    () => filterHistory(history, { search, category, direction, status: historyStatus }),
+    [history, search, category, direction, historyStatus]
+  );
+  const hasFilters = search.length > 0 || category !== "All" || direction !== "All" || historyStatus !== "All";
+
+  function confirmClearHistory() {
+    Alert.alert("Clear file history?", "This removes metadata only and will not delete saved files.", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Clear", style: "destructive", onPress: clearFileHistory },
+    ]);
+  }
 
   function pushFeed(text: string, kind: FeedEntry["kind"] = "info") {
     setFeed((prev) => [{ id: `${Date.now()}-${Math.random()}`, text, time: timeNow(), kind }, ...prev].slice(0, MAX_FEED_ENTRIES));
@@ -175,6 +204,7 @@ export default function DashboardScreen() {
           <View style={styles.radarCore}>
             <Feather name="shield" size={20} color={C.accent} />
           </View>
+
         </View>
 
         <Pressable style={styles.primaryButton} onPress={() => router.push("/")}>
@@ -206,6 +236,55 @@ export default function DashboardScreen() {
             </View>
           </View>
         </View>
+      </View>
+
+      <View style={styles.card}>
+        <View style={styles.rowBetween}>
+          <Text style={styles.eyebrow}>FILES / HISTORY</Text>
+          <Pressable accessibilityRole="button" accessibilityLabel="Clear file history" onPress={confirmClearHistory}>
+            <Text style={styles.clearHistoryText}>CLEAR</Text>
+          </Pressable>
+        </View>
+        <TextInput accessibilityLabel="Search file history" placeholder="Search filenames" placeholderTextColor={C.textFaint} value={search} onChangeText={setSearch} style={styles.historySearch} />
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
+          {(["All", "Images", "Videos", "Audio", "Documents", "Archives", "Other"] as const).map((value) => (
+            <Pressable key={value} accessibilityRole="button" accessibilityState={{ selected: category === value }} onPress={() => setCategory(value)} style={[styles.filterChip, category === value && styles.filterChipActive]}>
+              <Text style={styles.filterChipText}>{value}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
+          {(["All", "sent", "received"] as const).map((value) => (
+            <Pressable key={value} accessibilityRole="button" accessibilityState={{ selected: direction === value }} onPress={() => setDirection(value)} style={[styles.filterChip, direction === value && styles.filterChipActive]}>
+              <Text style={styles.filterChipText}>{value === "All" ? "All directions" : value}</Text>
+            </Pressable>
+          ))}
+          {(["All", "completed", "failed", "cancelled"] as const).map((value) => (
+            <Pressable key={value} accessibilityRole="button" accessibilityState={{ selected: historyStatus === value }} onPress={() => setHistoryStatus(value)} style={[styles.filterChip, historyStatus === value && styles.filterChipActive]}>
+              <Text style={styles.filterChipText}>{value === "All" ? "All statuses" : value}</Text>
+            </Pressable>
+          ))}
+        </ScrollView>
+        {hasFilters ? <Pressable accessibilityRole="button" onPress={() => { setSearch(""); setCategory("All"); setDirection("All"); setHistoryStatus("All"); }}><Text style={styles.clearFiltersText}>CLEAR FILTERS</Text></Pressable> : null}
+        <FlatList
+          data={filteredHistory}
+          keyExtractor={(item) => item.transferId}
+          scrollEnabled={false}
+          ListEmptyComponent={<Text style={styles.historyEmpty}>{history.length ? "No files match these filters." : "Completed and cancelled files will appear here."}</Text>}
+          renderItem={({ item }) => (
+            <View style={styles.historyRow}>
+              <View style={styles.historyIcon}><Feather name="file" size={15} color={C.accent} /></View>
+              <View style={styles.historyInfo}>
+                <Text style={styles.historyName} numberOfLines={1}>{item.filename}</Text>
+                <Text style={styles.historyMeta}>{item.category} · {item.direction} · {item.status}</Text>
+              </View>
+              <View style={styles.historyRight}>
+                <Text style={styles.historySize}>{formatHistorySize(item.size)}</Text>
+                <Text style={styles.historyTime}>{new Date(item.timestamp).toLocaleDateString()}</Text>
+              </View>
+            </View>
+          )}
+        />
       </View>
 
       {/* Stat cards — this app doesn't persist analytics yet, so these
@@ -429,6 +508,23 @@ const styles = StyleSheet.create({
   feedDot: { width: 6, height: 6, borderRadius: 3 },
   feedText: { color: C.text, fontSize: 12, flex: 1 },
   feedTime: { color: C.textFaint, fontSize: 10, fontFamily: mono },
+
+  clearHistoryText: { color: C.danger, fontSize: 10, fontFamily: mono, letterSpacing: 1 },
+  historySearch: { color: C.text, backgroundColor: C.surfaceAlt, borderWidth: 1, borderColor: C.border, borderRadius: R.sm, padding: 10, marginBottom: 10 },
+  filterRow: { gap: 6, paddingBottom: 8 },
+  filterChip: { borderWidth: 1, borderColor: C.borderSubtle, borderRadius: 999, paddingVertical: 6, paddingHorizontal: 9 },
+  filterChipActive: { borderColor: C.accent, backgroundColor: C.accentSoft },
+  filterChipText: { color: C.textMuted, fontSize: 10, fontFamily: mono },
+  clearFiltersText: { color: C.accent, fontSize: 10, fontFamily: mono, marginBottom: 10 },
+  historyEmpty: { color: C.textFaint, fontSize: 12, textAlign: "center", paddingVertical: 18 },
+  historyRow: { flexDirection: "row", alignItems: "center", borderTopWidth: 1, borderTopColor: C.borderSubtle, paddingVertical: 10, gap: 10 },
+  historyIcon: { width: 28, height: 28, borderRadius: 14, backgroundColor: C.accentSoft, alignItems: "center", justifyContent: "center" },
+  historyInfo: { flex: 1 },
+  historyName: { color: C.text, fontSize: 12, fontWeight: "600" },
+  historyMeta: { color: C.textMuted, fontSize: 10, fontFamily: mono, marginTop: 3 },
+  historyRight: { alignItems: "flex-end" },
+  historySize: { color: C.text, fontSize: 11, fontFamily: mono },
+  historyTime: { color: C.textFaint, fontSize: 9, fontFamily: mono, marginTop: 3 },
 
   featureGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10, marginTop: 12 },
   featureTile: {

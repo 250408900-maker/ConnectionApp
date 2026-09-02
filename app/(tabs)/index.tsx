@@ -33,6 +33,7 @@ import {
   setSharedSessionState,
   type SessionSnapshot,
 } from "@/constants/session-state";
+import { addFileHistory } from "@/constants/file-history";
 // ---- WebRTC platform shim ----
 // react-native-webrtc is a native module and cannot run on web. On web we
 // use the browser's built-in WebRTC globals instead. On native we lazily
@@ -252,6 +253,7 @@ export default function HomeScreen() {
 
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const messagesRef = useRef<ChatMessage[]>([]);
 
   const [activityLog, setActivityLog] = useState<ActivityEntry[]>([]);
   const [showLog, setShowLog] = useState(false);
@@ -318,6 +320,10 @@ export default function HomeScreen() {
   useEffect(() => {
     sessionCodeRef.current = sessionCode;
   }, [sessionCode]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => {
     callStateRef.current = callState;
@@ -695,6 +701,15 @@ export default function HomeScreen() {
       const transfer = incomingTransfersRef.current[payload.transferId];
       if (!transfer || transfer.received !== transfer.totalChunks) return;
       delete incomingTransfersRef.current[payload.transferId];
+      addFileHistory({
+        transferId: payload.transferId,
+        filename: transfer.fileName,
+        mimeType: transfer.mimeType,
+        size: transfer.size,
+        direction: "received",
+        status: "completed",
+        timestamp: new Date().toISOString(),
+      });
 
       const fullBase64 = transfer.chunks.join("");
 
@@ -802,12 +817,24 @@ export default function HomeScreen() {
     socket.on("file-transfer-chunk", handleFileTransferChunk);
     socket.on("file-transfer-end", handleFileTransferEnd);
     socket.on("file-transfer-cancelled", ({ transferId }: { transferId: string }) => {
-    const transfer = incomingTransfersRef.current[transferId];
-    const messageId = transfer?.messageId ?? transferId;
-    setMessages((current) => current.map((m) => m.id === messageId ? { ...m, status: "cancelled" } : m));
-    delete incomingTransfersRef.current[transferId];
-    cancelledTransfersRef.current.add(transferId);
-    logActivity("File transfer cancelled", "bad");
+      const transfer = incomingTransfersRef.current[transferId];
+      const messageId = transfer?.messageId ?? transferId;
+      const message = messagesRef.current.find((item) => item.id === messageId || item.transferId === transferId);
+      if (message?.fileName && message.mimeType && message.fileSize !== undefined) {
+        addFileHistory({
+          transferId,
+          filename: message.fileName,
+          mimeType: message.mimeType,
+          size: message.fileSize,
+          direction: message.sender === "me" ? "sent" : "received",
+          status: "cancelled",
+          timestamp: new Date().toISOString(),
+        });
+      }
+      setMessages((current) => current.map((m) => m.id === messageId ? { ...m, status: "cancelled" } : m));
+      delete incomingTransfersRef.current[transferId];
+      cancelledTransfersRef.current.add(transferId);
+      logActivity("File transfer cancelled", "bad");
     });
     socket.on("session-ended", handleSessionEnded);
     socket.on("peer-typing", handlePeerTyping);
@@ -1193,6 +1220,18 @@ export default function HomeScreen() {
   function cancelTransfer(transferId: string) {
     if (cancelledTransfersRef.current.has(transferId)) return;
     cancelledTransfersRef.current.add(transferId);
+    const message = messages.find((item) => item.id === transferId || item.transferId === transferId);
+    if (message?.fileName && message.mimeType && message.fileSize !== undefined) {
+      addFileHistory({
+        transferId,
+        filename: message.fileName,
+        mimeType: message.mimeType,
+        size: message.fileSize,
+        direction: message.sender === "me" ? "sent" : "received",
+        status: "cancelled",
+        timestamp: new Date().toISOString(),
+      });
+    }
     setMessages((current) =>
       current.map((message) =>
         (message.id === transferId || message.transferId === transferId)
@@ -1350,12 +1389,41 @@ export default function HomeScreen() {
         )
       );
       if (!endResponse.ok) {
+        addFileHistory({
+          transferId,
+          filename: fileName,
+          mimeType,
+          size: fileSize,
+          direction: "sent",
+          status: "failed",
+          timestamp: new Date().toISOString(),
+        });
         logActivity(`Failed to send ${fileName}`, "bad");
       } else {
+        addFileHistory({
+          transferId,
+          filename: fileName,
+          mimeType,
+          size: fileSize,
+          direction: "sent",
+          status: "completed",
+          timestamp: new Date().toISOString(),
+        });
         logActivity(`Sent ${kind}: ${fileName}`, "good");
       }
     } catch (error) {
       if (activeTransferId && cancelledTransfersRef.current.has(activeTransferId)) return;
+      if (activeTransferId) {
+        addFileHistory({
+          transferId: activeTransferId,
+          filename: fileName,
+          mimeType,
+          size: 0,
+          direction: "sent",
+          status: "failed",
+          timestamp: new Date().toISOString(),
+        });
+      }
       console.warn("sendAttachment failed", error);
       Alert.alert("Couldn't send that", "Something went wrong reading the file.");
     }

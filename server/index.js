@@ -79,9 +79,14 @@ function getPeerSocketId(session, callerSocketId) {
 }
 
 function getRoleForSocket(session, socketId) {
+  if (!session || !session.host) return null;
   if (session.host.socketId === socketId) return "host";
   if (session.guest && session.guest.socketId === socketId) return "guest";
   return null;
+}
+
+function cleanSessionCode(value) {
+  return typeof value === "string" ? value.trim().toUpperCase() : "";
 }
 
 io.on("connection", (socket) => {
@@ -140,11 +145,13 @@ io.on("connection", (socket) => {
 
  // ---------- WebRTC Signaling ----------
 
-socket.on("call-user", ({ sessionCode, offer }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
+socket.on("call-user", (payload) => {
+  if (!payload || typeof payload !== "object") return;
+  const { sessionCode, offer } = payload;
+  const cleanedCode = cleanSessionCode(sessionCode);
   const session = sessions[cleanedCode];
 
-  if (!session) return;
+  if (!session || getRoleForSocket(session, socket.id) === null || !offer) return;
 
   const peerId = getPeerSocketId(session, socket.id);
   if (!peerId) return;
@@ -152,11 +159,13 @@ socket.on("call-user", ({ sessionCode, offer }) => {
   io.to(peerId).emit("incoming-call", { offer });
 });
 
-socket.on("call-accepted", ({ sessionCode, answer }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
+socket.on("call-accepted", (payload) => {
+  if (!payload || typeof payload !== "object") return;
+  const { sessionCode, answer } = payload;
+  const cleanedCode = cleanSessionCode(sessionCode);
   const session = sessions[cleanedCode];
 
-  if (!session) return;
+  if (!session || getRoleForSocket(session, socket.id) === null || !answer) return;
 
   const peerId = getPeerSocketId(session, socket.id);
   if (!peerId) return;
@@ -164,11 +173,12 @@ socket.on("call-accepted", ({ sessionCode, answer }) => {
   io.to(peerId).emit("call-accepted", { answer });
 });
 
-socket.on("call-declined", ({ sessionCode }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
+socket.on("call-declined", (payload) => {
+  if (!payload || typeof payload !== "object") return;
+  const cleanedCode = cleanSessionCode(payload.sessionCode);
   const session = sessions[cleanedCode];
 
-  if (!session) return;
+  if (!session || getRoleForSocket(session, socket.id) === null) return;
 
   const peerId = getPeerSocketId(session, socket.id);
   if (!peerId) return;
@@ -176,11 +186,13 @@ socket.on("call-declined", ({ sessionCode }) => {
   io.to(peerId).emit("call-declined");
 });
 
-socket.on("call-ice-candidate", ({ sessionCode, candidate }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
+socket.on("call-ice-candidate", (payload) => {
+  if (!payload || typeof payload !== "object") return;
+  const { sessionCode, candidate } = payload;
+  const cleanedCode = cleanSessionCode(sessionCode);
   const session = sessions[cleanedCode];
 
-  if (!session) return;
+  if (!session || getRoleForSocket(session, socket.id) === null || !candidate) return;
 
   const peerId = getPeerSocketId(session, socket.id);
   if (!peerId) return;
@@ -188,11 +200,12 @@ socket.on("call-ice-candidate", ({ sessionCode, candidate }) => {
   io.to(peerId).emit("call-ice-candidate", { candidate });
 });
 
-socket.on("call-ended", ({ sessionCode }) => {
-  const cleanedCode = String(sessionCode).trim().toUpperCase();
+socket.on("call-ended", (payload) => {
+  if (!payload || typeof payload !== "object") return;
+  const cleanedCode = cleanSessionCode(payload.sessionCode);
   const session = sessions[cleanedCode];
 
-  if (!session) return;
+  if (!session || getRoleForSocket(session, socket.id) === null) return;
 
   const peerId = getPeerSocketId(session, socket.id);
   if (!peerId) return;
@@ -200,8 +213,13 @@ socket.on("call-ended", ({ sessionCode }) => {
   io.to(peerId).emit("call-ended");
 });
 
-  socket.on("rejoin-session", ({ sessionCode, role, participantId, reconnectToken }) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
+  socket.on("rejoin-session", (payload) => {
+    if (!payload || typeof payload !== "object") {
+      socket.emit("rejoin-error", "Invalid reconnect request.");
+      return;
+    }
+    const { sessionCode, role, participantId, reconnectToken } = payload;
+    const cleanedCode = cleanSessionCode(sessionCode);
     const session = sessions[cleanedCode];
 
     if (!session) {
@@ -209,6 +227,10 @@ socket.on("call-ended", ({ sessionCode }) => {
       return;
     }
 
+    if (role !== "host" && role !== "guest") {
+      socket.emit("rejoin-error", "Invalid role.");
+      return;
+    }
     const participant = session[role];
     if (!validToken(participant, participantId, reconnectToken)) {
       socket.emit("rejoin-error", "Invalid reconnect credentials.");
@@ -237,9 +259,6 @@ socket.on("call-ended", ({ sessionCode }) => {
       session.guest.online = true;
       if (session.guest.timer) clearTimeout(session.guest.timer);
       session.guest.timer = null;
-    } else {
-      socket.emit("rejoin-error", "Invalid role.");
-      return;
     }
 
     socket.join(cleanedCode);
@@ -252,8 +271,9 @@ socket.on("call-ended", ({ sessionCode }) => {
     console.log(`${socket.id} rejoined session ${cleanedCode} as ${role}`);
   });
 
-  socket.on("end-session", ({ sessionCode }) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
+  socket.on("end-session", (payload) => {
+    if (!payload || typeof payload !== "object") return;
+    const cleanedCode = cleanSessionCode(payload.sessionCode);
     const session = sessions[cleanedCode];
 
     if (!session) return;
@@ -265,9 +285,12 @@ socket.on("call-ended", ({ sessionCode }) => {
     endSession(cleanedCode, "closed");
   });
 
-  socket.on("send-message", ({ sessionCode, message, messageId }, callback) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
-    const cleanedMessage = String(message).trim();
+  socket.on("send-message", (payload, callback) => {
+    const messageId = payload && typeof payload === "object" ? payload.messageId : undefined;
+    const cleanedCode = cleanSessionCode(payload && typeof payload === "object" ? payload.sessionCode : undefined);
+    const cleanedMessage = payload && typeof payload === "object" && typeof payload.message === "string"
+      ? payload.message.trim()
+      : "";
     const session = sessions[cleanedCode];
     const ack = typeof callback === "function" ? callback : () => {};
 
@@ -299,11 +322,12 @@ socket.on("call-ended", ({ sessionCode }) => {
     socket.to(cleanedCode).emit("receive-message", cleanedMessage);
     ack({ ok: true, messageId });
 
-    console.log(`Message sent in ${cleanedCode}: ${cleanedMessage}`);
+    console.log(`Message sent in ${cleanedCode} (${cleanedMessage.length} characters)`);
   });
 
-  socket.on("typing", ({ sessionCode }) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
+  socket.on("typing", (payload) => {
+    if (!payload || typeof payload !== "object") return;
+    const cleanedCode = cleanSessionCode(payload.sessionCode);
     const session = sessions[cleanedCode];
 
     if (!session) return;
@@ -315,8 +339,9 @@ socket.on("call-ended", ({ sessionCode }) => {
     socket.to(cleanedCode).emit("peer-typing");
   });
 
-  socket.on("stop-typing", ({ sessionCode }) => {
-    const cleanedCode = String(sessionCode).trim().toUpperCase();
+  socket.on("stop-typing", (payload) => {
+    if (!payload || typeof payload !== "object") return;
+    const cleanedCode = cleanSessionCode(payload.sessionCode);
     const session = sessions[cleanedCode];
 
     if (!session) return;
@@ -338,20 +363,16 @@ socket.on("call-ended", ({ sessionCode }) => {
   socket.on(
     "file-transfer-start",
     (
-      {
-        sessionCode,
-        transferId,
-        name,
-        size,
-        mimeType,
-        totalChunks,
-        kind,
-        durationMs,
-      },
+      payload,
       callback
     ) => {
       const ack = typeof callback === "function" ? callback : () => {};
-      const cleanedCode = String(sessionCode).trim().toUpperCase();
+      if (!payload || typeof payload !== "object") {
+        ack({ ok: false, error: "Invalid transfer metadata or session." });
+        return;
+      }
+      const { sessionCode, transferId, name, size, mimeType, totalChunks, kind, durationMs } = payload;
+      const cleanedCode = cleanSessionCode(sessionCode);
       const session = sessions[cleanedCode];
       const validMetadata = validateMetadata({ transferId, name, size, mimeType, totalChunks });
       if (!validMetadata || getRoleForSocket(session, socket.id) === null) {
@@ -388,10 +409,15 @@ socket.on("call-ended", ({ sessionCode }) => {
 
   socket.on(
     "file-transfer-chunk",
-    ({ sessionCode, transferId, index, data }, callback) => {
-      const cleanedCode = String(sessionCode).trim().toUpperCase();
-      const session = sessions[cleanedCode];
+    (payload, callback) => {
       const ack = typeof callback === "function" ? callback : () => {};
+      if (!payload || typeof payload !== "object") {
+        ack({ ok: false, error: "Invalid chunk." });
+        return;
+      }
+      const { sessionCode, transferId, index, data } = payload;
+      const cleanedCode = cleanSessionCode(sessionCode);
+      const session = sessions[cleanedCode];
 
       if (!session) {
         ack({ ok: false });
@@ -441,10 +467,15 @@ socket.on("call-ended", ({ sessionCode }) => {
 
   socket.on(
     "file-transfer-end",
-    ({ sessionCode, transferId }, callback) => {
-      const cleanedCode = String(sessionCode).trim().toUpperCase();
-      const session = sessions[cleanedCode];
+    (payload, callback) => {
       const ack = typeof callback === "function" ? callback : () => {};
+      if (!payload || typeof payload !== "object") {
+        ack({ ok: false, error: "Invalid transfer." });
+        return;
+      }
+      const { sessionCode, transferId } = payload;
+      const cleanedCode = cleanSessionCode(sessionCode);
+      const session = sessions[cleanedCode];
   
       if (!session) {
         ack({ ok: false, error: "Session not found" });
@@ -475,14 +506,20 @@ socket.on("call-ended", ({ sessionCode }) => {
 
 );
 
-  socket.on("file-transfer-cancel", ({ sessionCode, transferId }, callback) => {
+  socket.on("file-transfer-cancel", (payload, callback) => {
     const ack = typeof callback === "function" ? callback : () => {};
-    const session = sessions[String(sessionCode).trim().toUpperCase()];
+    if (!payload || typeof payload !== "object") {
+      ack({ ok: false, error: "Unauthorized transfer." });
+      return;
+    }
+    const { sessionCode, transferId } = payload;
+    const cleanedCode = cleanSessionCode(sessionCode);
+    const session = sessions[cleanedCode];
     if (!session || !cancelTransfer(session.transfers, transferId, socket.id)) {
       ack({ ok: false, error: "Unauthorized transfer." });
       return;
     }
-    socket.to(String(sessionCode).trim().toUpperCase()).emit("file-transfer-cancelled", { transferId });
+    socket.to(cleanedCode).emit("file-transfer-cancelled", { transferId });
     ack({ ok: true });
   });
 
