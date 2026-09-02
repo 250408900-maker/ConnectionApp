@@ -15,6 +15,7 @@ import { useRouter } from "expo-router";
 
 import { DashboardColors as C, DashboardRadii as R, mono } from "@/constants/dashboard-theme";
 import { socket } from "@/constants/socket";
+import { setSharedSessionState, useSharedSessionState } from "@/constants/session-state";
 
 // ---- Types -----------------------------------------------------------
 
@@ -63,11 +64,9 @@ function deviceLabel() {
 
 export default function DashboardScreen() {
   const router = useRouter();
+  const { connected, sessionCode, peerConnected } = useSharedSessionState();
 
-  const [connected, setConnected] = useState(socket.connected);
   const [feed, setFeed] = useState<FeedEntry[]>([]);
-  const [sessionCode, setSessionCode] = useState<string | null>(null);
-  const [peerConnected, setPeerConnected] = useState(false);
   const startedAt = useRef(Date.now());
   const [uptimeLabel, setUptimeLabel] = useState("0m");
 
@@ -76,26 +75,28 @@ export default function DashboardScreen() {
   }
 
   useEffect(() => {
+    setSharedSessionState({ connected: socket.connected });
+
     // Reflects the real shared socket — the same connection the Connect
     // screen uses — rather than a separate, disconnected "demo" status.
     function onConnect() {
-      setConnected(true);
+      setSharedSessionState({ connected: true });
       pushFeed("Connected to server", "good");
     }
     function onDisconnect() {
-      setConnected(false);
+      setSharedSessionState({ connected: false, peerConnected: false });
       pushFeed("Disconnected from server", "bad");
     }
     function onSessionCreated(code: string) {
-      setSessionCode(code);
+      setSharedSessionState({ sessionCode: code, peerConnected: false });
       pushFeed(`Channel ${code} created`, "good");
     }
     function onJoinSuccess(code: string) {
-      setSessionCode(code);
+      setSharedSessionState({ sessionCode: code });
       pushFeed(`Joined channel ${code}`, "good");
     }
     function onSessionConnected() {
-      setPeerConnected(true);
+      setSharedSessionState({ peerConnected: true });
       pushFeed("Peer connected", "good");
     }
     function onReceiveMessage() {
@@ -177,7 +178,7 @@ export default function DashboardScreen() {
         </View>
 
         <Pressable style={styles.primaryButton} onPress={() => router.push("/")}>
-          <Feather name="plus" size={16} color={C.bg} />
+          <Feather name="plus" size={16} color={C.text} />
           <View style={{ marginLeft: 10 }}>
             <Text style={styles.primaryButtonText}>CREATE CHANNEL</Text>
             <Text style={styles.primaryButtonSubtext}>Generate a new 6-character code</Text>
@@ -218,7 +219,7 @@ export default function DashboardScreen() {
         <View style={styles.statCard}>
           <Text style={styles.statLabel}>ACTIVE CHANNEL</Text>
           <Text style={styles.statValue}>{peerConnected ? "Paired" : sessionCode ? "Waiting" : "None"}</Text>
-          <Text style={styles.statSub}>{sessionCode ?? "Not connected"}</Text>
+          <Text style={styles.statSub}>{peerConnected ? "Connected" : sessionCode ? "Waiting" : "Not connected"}</Text>
         </View>
         <View style={styles.statCard}>
           <Text style={styles.statLabel}>SESSION UPTIME</Text>
@@ -320,6 +321,7 @@ const styles = StyleSheet.create({
     height: 7,
     borderRadius: 4,
     marginRight: 6,
+    backgroundColor: C.accent,
   },
   onlineText: { color: C.textMuted, fontSize: 10, fontFamily: mono, letterSpacing: 1 },
 
@@ -350,7 +352,7 @@ const styles = StyleSheet.create({
     height: 58,
     borderRadius: 29,
     borderWidth: 1,
-    borderColor: C.accentDim,
+    borderColor: C.border,
   },
   radarCore: {
     width: 40,
@@ -366,14 +368,16 @@ const styles = StyleSheet.create({
   primaryButton: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: C.accent,
+    backgroundColor: C.surfaceAlt,
+    borderWidth: 1,
+    borderColor: C.border,
     borderRadius: R.md,
     paddingVertical: 14,
     paddingHorizontal: 16,
     marginBottom: 10,
   },
-  primaryButtonText: { color: C.bg, fontSize: 13, fontWeight: "700", letterSpacing: 0.5 },
-  primaryButtonSubtext: { color: "#0C3D22", fontSize: 11, marginTop: 2 },
+  primaryButtonText: { color: C.text, fontSize: 13, fontWeight: "700", letterSpacing: 0.5 },
+  primaryButtonSubtext: { color: C.textMuted, fontSize: 11, marginTop: 2 },
 
   secondaryButton: {
     flexDirection: "row",
@@ -444,10 +448,12 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     borderWidth: 1,
+    borderColor: C.border,
     borderRadius: R.md,
     paddingVertical: 12,
     paddingHorizontal: 16,
     gap: 8,
+    backgroundColor: C.surfaceAlt,
   },
   bottomBannerText: { fontSize: 11, fontFamily: mono, letterSpacing: 1, flex: 1 },
   bottomBannerMeta: { color: C.textFaint, fontSize: 10, fontFamily: mono },

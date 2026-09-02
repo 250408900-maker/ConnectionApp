@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Alert,
@@ -20,22 +20,13 @@ import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
 import * as Sharing from "expo-sharing";
-import { io } from "socket.io-client";
 
 import {
   DashboardColors as C,
   DashboardRadii as R,
 } from "@/constants/dashboard-theme";
-
-const SERVER_URL = "http://130.61.28.42:3000";
-
-const socket = io(SERVER_URL, {
-  transports: ["websocket"],
-  reconnection: true,
-  reconnectionAttempts: 5,
-  reconnectionDelay: 1000,
-  reconnectionDelayMax: 5000,
-});
+import { socket } from "@/constants/socket";
+import { resetSharedSessionState, setSharedSessionState } from "@/constants/session-state";
 // ---- WebRTC platform shim ----
 // react-native-webrtc is a native module and cannot run on web. On web we
 // use the browser's built-in WebRTC globals instead. On native we lazily
@@ -319,6 +310,24 @@ export default function HomeScreen() {
     callStateRef.current = callState;
   }, [callState]);
 
+  const peerOnlineRef = useRef(false);
+
+  useEffect(() => {
+    peerOnlineRef.current = peerOnline;
+  }, [peerOnline]);
+
+  const syncSharedSessionState = useCallback(
+    (patch: Partial<{ connected: boolean; sessionCode: string | null; peerConnected: boolean }> = {}) => {
+      setSharedSessionState({
+        connected: socket.connected,
+        sessionCode: sessionCodeRef.current || null,
+        peerConnected: peerOnlineRef.current,
+        ...patch,
+      });
+    },
+    []
+  );
+
   function logActivity(text: string, kind: ActivityEntry["kind"] = "info") {
     setActivityLog((current) => {
       const next = [...current, { id: makeMessageId(), text, time: timeNowPrecise(), kind }];
@@ -410,11 +419,13 @@ export default function HomeScreen() {
       setPeerTyping(false);
       roleRef.current = null;
       incomingTransfersRef.current = {};
+      resetSharedSessionState();
       cleanupCall();
     }
 
     function handleConnect() {
       logActivity("Connected to server", "good");
+      syncSharedSessionState({ connected: true });
       if (sessionCodeRef.current && roleRef.current) {
         setLinkState("reconnecting");
         socket.emit("rejoin-session", {
@@ -428,6 +439,8 @@ export default function HomeScreen() {
 
     function handleDisconnect() {
       logActivity("Disconnected from server", "bad");
+      incomingTransfersRef.current = {};
+      setSharedSessionState({ connected: false, peerConnected: false });
       if (sessionCodeRef.current) {
         setLinkState("lost");
         setPeerOnline(false);
@@ -453,6 +466,7 @@ export default function HomeScreen() {
       setMessages([]);
       setPeerOnline(false);
       setPeerTyping(false);
+      syncSharedSessionState({ sessionCode: code, peerConnected: false });
       logActivity(`Channel created: ${code}`, "good");
     }
 
@@ -462,6 +476,7 @@ export default function HomeScreen() {
       setLinkState("paired");
       setMessages([]);
       setPeerTyping(false);
+      syncSharedSessionState({ sessionCode: code });
       logActivity(`Tuned in to channel ${code}`, "good");
     }
 
@@ -474,6 +489,7 @@ export default function HomeScreen() {
     function handleSessionConnected() {
       setLinkState("paired");
       setPeerOnline(true);
+      syncSharedSessionState({ peerConnected: true });
       logActivity("Peer joined the channel", "good");
     }
 
@@ -481,6 +497,7 @@ export default function HomeScreen() {
       setSessionCode(payload.sessionCode);
       setLinkState("paired");
       setPeerOnline(payload.peerOnline);
+      syncSharedSessionState({ sessionCode: payload.sessionCode, peerConnected: payload.peerOnline });
       logActivity("Rejoined channel after reconnect", "good");
     }
 
@@ -494,11 +511,13 @@ export default function HomeScreen() {
     function handlePeerOffline() {
       setPeerOnline(false);
       setPeerTyping(false);
+      syncSharedSessionState({ peerConnected: false });
       logActivity("Peer went offline", "bad");
     }
 
     function handlePeerReconnected() {
       setPeerOnline(true);
+      syncSharedSessionState({ peerConnected: true });
       logActivity("Peer reconnected", "good");
     }
 
@@ -736,7 +755,7 @@ export default function HomeScreen() {
     // tears down and re-creates every socket listener (which previously
     // re-ran handleConnect() -> emitted a spurious "rejoin-session" ->
     // server replied "Host slot already active" -> channel got reset).
-  }, []);
+  }, [syncSharedSessionState]);
 
   function createSession() {
     socket.emit("create-session");
@@ -1329,7 +1348,12 @@ export default function HomeScreen() {
       return;
     }
 
-    Alert.alert("Send attachment", undefined, [
+    if (Platform.OS === "web") {
+      pickDocument();
+      return;
+    }
+
+    Alert.alert("Send attachment", "Choose a file type to send.", [
       { text: "Photo", onPress: pickImage },
       { text: "File", onPress: pickDocument },
       { text: "Cancel", style: "cancel" },
@@ -1889,13 +1913,15 @@ const styles = StyleSheet.create({
   },
 
   primaryButton: {
-    backgroundColor: C.accent,
+    backgroundColor: C.surfaceAlt,
+    borderWidth: 1,
+    borderColor: C.border,
     paddingVertical: 17,
     borderRadius: R.md,
   },
 
   primaryButtonText: {
-    color: C.bg,
+    color: C.text,
     textAlign: "center",
     fontSize: 16,
     fontWeight: "700",

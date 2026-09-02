@@ -3,24 +3,24 @@
  */
 
 export const DashboardColors = {
-    bg: "#05070A",
-    bgElevated: "#0A0E12",
-    surface: "#0E1319",
-    surfaceAlt: "#0B1015",
-    border: "#1B222B",
-    borderSubtle: "#141A21",
-  
-    accent: "#22E07C",
-    accentDim: "#16693F",
-    accentSoft: "rgba(34, 224, 124, 0.12)",
-  
-    text: "#EAF0EC",
-    textMuted: "#8B98A5",
-    textFaint: "#5A6570",
-  
-    danger: "#E0645A",
-    warning: "#D9A441",
-    info: "#5B9FE0",
+    bg: "#0A0C0E",
+    bgElevated: "#101417",
+    surface: "#12181D",
+    surfaceAlt: "#181E24",
+    border: "#2A3037",
+    borderSubtle: "#212930",
+
+    accent: "#5AD88A",
+    accentDim: "#1F4533",
+    accentSoft: "rgba(90, 216, 138, 0.12)",
+
+    text: "#F5F7FA",
+    textMuted: "#A6AFB8",
+    textFaint: "#7A8692",
+
+    danger: "#E06A5A",
+    warning: "#D8B26D",
+    info: "#9AAAC0",
   };
   
   export const DashboardRadii = {
