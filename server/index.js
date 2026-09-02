@@ -8,6 +8,12 @@ const {
   matchesParticipant,
   markOffline: markParticipantOffline,
 } = require("./session-manager");
+const {
+  acceptChunk,
+  cancelTransfer,
+  createTransfer,
+  validateMetadata,
+} = require("./transfer-manager");
 
 const app = express();
 const server = http.createServer(app);
@@ -58,6 +64,7 @@ function endSession(code, reason) {
   if (session.guest && session.guest.timer) clearTimeout(session.guest.timer);
 
   io.to(code).emit("session-ended", reason || "closed");
+  if (session.transfers) session.transfers.clear();
   delete sessions[code];
 
   console.log(`Session ${code} ended (${reason || "closed"})`);
@@ -88,6 +95,7 @@ io.on("connection", (socket) => {
     }
 
     sessions[code] = createSession(code, socket.id);
+    sessions[code].transfers = new Map();
 
     socket.join(code);
     socket.emit("session-created", { sessionCode: code, ...credentials(sessions[code].host) });
@@ -121,6 +129,7 @@ io.on("connection", (socket) => {
       ...createSession(cleanedCode, socket.id).host,
       role: "guest",
     };
+    if (!session.transfers) session.transfers = new Map();
     socket.join(cleanedCode);
 
     socket.emit("join-success", { sessionCode: cleanedCode, ...credentials(session.guest) });
@@ -341,38 +350,39 @@ socket.on("call-ended", ({ sessionCode }) => {
       },
       callback
     ) => {
-
+      const ack = typeof callback === "function" ? callback : () => {};
       const cleanedCode = String(sessionCode).trim().toUpperCase();
       const session = sessions[cleanedCode];
-
-      if (!session) return;
-
-      const belongsToSession =
-        getRoleForSocket(session, socket.id) !== null;
-
-      if (!belongsToSession) return;
+      const validMetadata = validateMetadata({ transferId, name, size, mimeType, totalChunks });
+      if (!validMetadata || getRoleForSocket(session, socket.id) === null) {
+        ack({ ok: false, error: "Invalid transfer metadata or session." });
+        return;
+      }
+      if (session.transfers.has(transferId)) {
+        ack({ ok: false, error: "Transfer already exists." });
+        return;
+      }
 
       const role = getRoleForSocket(session, socket.id);
       const peerOnline = role === "host" ? Boolean(session.guest && session.guest.online) : session.host.online;
-
-      if (!peerOnline) return;
+      if (!peerOnline) {
+        ack({ ok: false, error: "Peer is offline." });
+        return;
+      }
+      session.transfers.set(transferId, createTransfer(socket.id, getPeerSocketId(session, socket.id), { totalChunks }));
 
       socket
   .to(cleanedCode)
   .emit("file-transfer-start", {
     transferId,
-    fileName: name,
+    fileName: name.trim(),
     fileSize: size,
     mimeType,
     totalChunks,
     kind,
     durationMs,
   });
-        console.log(
-          `File transfer started in ${cleanedCode}: "${name}" (${size} bytes, ${totalChunks} chunks)`
-        );
-        
-        callback?.({ ok: true });
+  ack({ ok: true });
     }
   );
 
@@ -387,9 +397,21 @@ socket.on("call-ended", ({ sessionCode }) => {
         ack({ ok: false });
         return;
       }
-
+      const transfer = session.transfers.get(transferId);
+      if (!transfer || transfer.senderSocketId !== socket.id) {
+        ack({ ok: false, error: "Unauthorized transfer." });
+        return;
+      }
+      const chunkResult = acceptChunk(transfer, index, data);
+      if (!chunkResult.ok) {
+        ack(chunkResult);
+        return;
+      }
+      if (chunkResult.duplicate) {
+        ack({ ok: true, duplicate: true, index });
+        return;
+      }
       const belongsToSession = getRoleForSocket(session, socket.id) !== null;
-
       if (!belongsToSession) {
         ack({ ok: false });
         return;
@@ -406,8 +428,13 @@ socket.on("call-ended", ({ sessionCode }) => {
       // Direct socket-to-socket emit (not a room broadcast) so we can use a
       // real acknowledgement callback: room/broadcast emits in socket.io
       // don't support acks the way a single socket.emit(event, data, cb) does.
-      peerSocket.emit("file-transfer-chunk", { transferId, index, data }, (peerAck) => {
-        ack(peerAck && peerAck.ok ? { ok: true } : { ok: false });
+      peerSocket.emit("file-transfer-chunk", { transferId, chunkIndex: index, data }, (peerAck) => {
+        if (peerAck && peerAck.ok) {
+          ack({ ok: true, index });
+        } else {
+          transfer.nextIndex -= 1;
+          ack({ ok: false, error: "Receiver rejected chunk." });
+        }
       });
     }
   );
@@ -424,14 +451,20 @@ socket.on("call-ended", ({ sessionCode }) => {
         return;
       }
   
+      const transfer = session.transfers.get(transferId);
       const belongsToSession = getRoleForSocket(session, socket.id) !== null;
   
       if (!belongsToSession) {
         ack({ ok: false, error: "Not part of this session" });
         return;
       }
-  
+      if (!transfer || transfer.senderSocketId !== socket.id || transfer.nextIndex !== transfer.totalChunks) {
+        ack({ ok: false, error: "Transfer is incomplete." });
+        return;
+      }
+
       socket.to(cleanedCode).emit("file-transfer-end", { transferId });
+      session.transfers.delete(transferId);
   
       ack({ ok: true });
   
@@ -441,6 +474,17 @@ socket.on("call-ended", ({ sessionCode }) => {
     }
 
 );
+
+  socket.on("file-transfer-cancel", ({ sessionCode, transferId }, callback) => {
+    const ack = typeof callback === "function" ? callback : () => {};
+    const session = sessions[String(sessionCode).trim().toUpperCase()];
+    if (!session || !cancelTransfer(session.transfers, transferId, socket.id)) {
+      ack({ ok: false, error: "Unauthorized transfer." });
+      return;
+    }
+    socket.to(String(sessionCode).trim().toUpperCase()).emit("file-transfer-cancelled", { transferId });
+    ack({ ok: true });
+  });
 
   socket.on("disconnect", () => {
     console.log("Device disconnected:", socket.id);

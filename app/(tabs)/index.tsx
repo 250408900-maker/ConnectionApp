@@ -70,7 +70,7 @@ const ICE_SERVERS = {
 
 type CallState = "idle" | "calling" | "ringing" | "connected";
 
-type MessageStatus = "sending" | "delivered" | "failed";
+type MessageStatus = "preparing" | "sending" | "receiving" | "paused" | "completed" | "cancelled" | "delivered" | "failed";
 type MessageKind = "text" | "image" | "file" | "voice";
 
 type ChatMessage = {
@@ -91,6 +91,7 @@ type ChatMessage = {
   localUri?: string; // on-disk path once a file/voice message has been saved
   durationMs?: number; // voice-message duration
   progress?: number; // 0-100, used while a transfer is in flight
+  transferId?: string;
 };
 
 type LinkState =
@@ -302,14 +303,17 @@ export default function HomeScreen() {
       {
         chunks: string[];
         received: number;
+        nextIndex: number;
         totalChunks: number;
         messageId: string;
         kind: MessageKind;
         fileName: string;
         mimeType: string;
+        size: number;
       }
     >
   >({});
+  const cancelledTransfersRef = useRef(new Set<string>());
 
   useEffect(() => {
     sessionCodeRef.current = sessionCode;
@@ -612,17 +616,26 @@ export default function HomeScreen() {
       kind: MessageKind;
       totalChunks: number;
       durationMs?: number;
-    }) {
+    }, callback?: (response: { ok: boolean; error?: string }) => void) {
+      if (!payload.transferId || !Number.isInteger(payload.totalChunks) || payload.totalChunks < 1 ||
+          !Number.isInteger(payload.fileSize) || payload.fileSize < 0 || payload.fileSize > MAX_FILE_BYTES ||
+          typeof payload.fileName !== "string" || !payload.fileName.trim()) {
+        callback?.({ ok: false, error: "Invalid transfer metadata." });
+        return;
+      }
+      const safeName = payload.fileName.replace(/[\\/:*?"<>|]/g, "_").trim().slice(0, 255);
       const messageId = makeMessageId();
 
       incomingTransfersRef.current[payload.transferId] = {
         chunks: new Array(payload.totalChunks),
         received: 0,
+        nextIndex: 0,
         totalChunks: payload.totalChunks,
         messageId,
         kind: payload.kind,
-        fileName: payload.fileName,
+        fileName: safeName,
         mimeType: payload.mimeType,
+        size: payload.fileSize,
       };
 
       setPeerTyping(false);
@@ -630,40 +643,57 @@ export default function HomeScreen() {
         ...current,
         {
           id: messageId,
+          transferId: payload.transferId,
           kind: payload.kind,
           sender: "other",
           timestamp: timeNow(),
-          fileName: payload.fileName,
+          fileName: safeName,
           fileSize: payload.fileSize,
           mimeType: payload.mimeType,
           durationMs: payload.durationMs,
           progress: 0,
+          status: "receiving",
         },
       ]);
 
-      logActivity(`Receiving ${payload.kind}: ${payload.fileName}`, "info");
+      callback?.({ ok: true });
+      logActivity(`Receiving ${payload.kind}: ${safeName}`, "info");
     }
 
     function handleFileTransferChunk(payload: {
       transferId: string;
       chunkIndex: number;
       data: string;
-    }) {
+    }, callback?: (response: { ok: boolean; error?: string }) => void) {
       const transfer = incomingTransfersRef.current[payload.transferId];
-      if (!transfer) return;
+      if (!transfer || typeof payload.data !== "string" || payload.data.length === 0 ||
+          payload.data.length > CHUNK_SIZE || !Number.isInteger(payload.chunkIndex)) {
+        callback?.({ ok: false, error: "Invalid chunk." });
+        return;
+      }
+      if (payload.chunkIndex < transfer.nextIndex) {
+        callback?.({ ok: true });
+        return;
+      }
+      if (payload.chunkIndex !== transfer.nextIndex) {
+        callback?.({ ok: false, error: "Out-of-order chunk." });
+        return;
+      }
 
       transfer.chunks[payload.chunkIndex] = payload.data;
       transfer.received += 1;
+      transfer.nextIndex += 1;
 
       const progress = Math.round((transfer.received / transfer.totalChunks) * 100);
       setMessages((current) =>
         current.map((m) => (m.id === transfer.messageId ? { ...m, progress } : m))
       );
+      callback?.({ ok: true });
     }
 
     async function handleFileTransferEnd(payload: { transferId: string }) {
       const transfer = incomingTransfersRef.current[payload.transferId];
-      if (!transfer) return;
+      if (!transfer || transfer.received !== transfer.totalChunks) return;
       delete incomingTransfersRef.current[payload.transferId];
 
       const fullBase64 = transfer.chunks.join("");
@@ -671,7 +701,7 @@ export default function HomeScreen() {
       if (transfer.kind === "image") {
         setMessages((current) =>
           current.map((m) =>
-            m.id === transfer.messageId ? { ...m, data: fullBase64, progress: 100 } : m
+            m.id === transfer.messageId ? { ...m, data: fullBase64, progress: 100, status: "completed" } : m
           )
         );
       } else {
@@ -682,7 +712,7 @@ export default function HomeScreen() {
           });
           setMessages((current) =>
             current.map((m) =>
-              m.id === transfer.messageId ? { ...m, localUri: path, progress: 100 } : m
+              m.id === transfer.messageId ? { ...m, localUri: path, progress: 100, status: "completed" } : m
             )
           );
         } catch (error) {
@@ -771,6 +801,14 @@ export default function HomeScreen() {
     socket.on("file-transfer-start", handleFileTransferStart);
     socket.on("file-transfer-chunk", handleFileTransferChunk);
     socket.on("file-transfer-end", handleFileTransferEnd);
+    socket.on("file-transfer-cancelled", ({ transferId }: { transferId: string }) => {
+    const transfer = incomingTransfersRef.current[transferId];
+    const messageId = transfer?.messageId ?? transferId;
+    setMessages((current) => current.map((m) => m.id === messageId ? { ...m, status: "cancelled" } : m));
+    delete incomingTransfersRef.current[transferId];
+    cancelledTransfersRef.current.add(transferId);
+    logActivity("File transfer cancelled", "bad");
+    });
     socket.on("session-ended", handleSessionEnded);
     socket.on("peer-typing", handlePeerTyping);
     socket.on("peer-stop-typing", handlePeerStopTyping);
@@ -812,6 +850,7 @@ export default function HomeScreen() {
       socket.off("file-transfer-start", handleFileTransferStart);
       socket.off("file-transfer-chunk", handleFileTransferChunk);
       socket.off("file-transfer-end", handleFileTransferEnd);
+      socket.off("file-transfer-cancelled");
       socket.off("session-ended", handleSessionEnded);
       socket.off("peer-typing", handlePeerTyping);
       socket.off("peer-stop-typing", handlePeerStopTyping);
@@ -1135,11 +1174,33 @@ export default function HomeScreen() {
       Alert.alert("No peer connected", "Wait for the other device before retrying.");
       return;
     }
+
     if (chatMessage.kind === "text" && chatMessage.text) {
       dispatchMessage(chatMessage.text, chatMessage.id);
     }
+
     // Failed file/image transfers are simplest to re-send from the picker
     // again rather than resume — chunk-level resume isn't implemented yet.
+  }
+
+  function canCancelTransfer(chatMessage: ChatMessage) {
+    return (
+      (chatMessage.kind === "file" || chatMessage.kind === "image" || chatMessage.kind === "voice") &&
+      ["preparing", "sending", "receiving", "paused"].includes(chatMessage.status ?? "")
+    );
+  }
+
+  function cancelTransfer(transferId: string) {
+    if (cancelledTransfersRef.current.has(transferId)) return;
+    cancelledTransfersRef.current.add(transferId);
+    setMessages((current) =>
+      current.map((message) =>
+        (message.id === transferId || message.transferId === transferId)
+          ? { ...message, status: "cancelled" }
+          : message
+      )
+    );
+    socket.emit("file-transfer-cancel", { sessionCode, transferId }, () => {});
   }
 
   // ---- File transfer: sending side ----
@@ -1156,6 +1217,7 @@ export default function HomeScreen() {
       return;
     }
 
+    let activeTransferId: string | null = null;
     try {
       let fileSize = 0;
       let base64 = "";
@@ -1201,6 +1263,8 @@ export default function HomeScreen() {
       const totalChunks = Math.max(1, Math.ceil(base64.length / CHUNK_SIZE));
 
       const transferId = makeMessageId();
+      activeTransferId = transferId;
+      cancelledTransfersRef.current.delete(transferId);
 
       const localMessage: ChatMessage = {
         id: transferId,
@@ -1212,7 +1276,7 @@ export default function HomeScreen() {
         mimeType,
         data: kind === "image" ? base64 : undefined,
         localUri: uri,
-        status: "sending",
+        status: "preparing",
         progress: 0,
         durationMs,
       };
@@ -1220,7 +1284,15 @@ export default function HomeScreen() {
       setMessages((current) => [...current, localMessage]);
       logActivity(`Sending ${kind}: ${fileName}`, "info");
 
-      socket.emit(
+      const emitWithAck = <T,>(event: string, payload: unknown) =>
+        new Promise<T>((resolve, reject) => {
+          socket.timeout(SEND_ACK_TIMEOUT_MS).emit(event, payload, (error: Error | null, response: T) => {
+            if (error) reject(error);
+            else resolve(response);
+          });
+        });
+
+      await emitWithAck<{ ok: boolean }>(
         "file-transfer-start",
         {
           transferId,
@@ -1231,57 +1303,59 @@ export default function HomeScreen() {
           totalChunks,
           kind,
           durationMs,
-        },
-        (response: { ok: boolean; error?: string }) => {
-          console.log("START ACK:", response);
         }
+      );
+      if (cancelledTransfersRef.current.has(transferId)) return;
+      setMessages((current) =>
+        current.map((message) => message.id === transferId ? { ...message, status: "sending" } : message)
       );
 
       for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        if (cancelledTransfersRef.current.has(transferId)) return;
         const chunk = base64.slice(chunkIndex * CHUNK_SIZE, (chunkIndex + 1) * CHUNK_SIZE);
 
-        socket.emit(
-          "file-transfer-chunk",
-          {
-            transferId,
-            sessionCode,
-            index: chunkIndex,
-            data: chunk,
-          },
-          (response: { ok: boolean }) => {
-            console.log("CHUNK ACK:", response);
-          }
-        );
-
-        const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
-
-        setMessages((current) => current.map((m) => (m.id === transferId ? { ...m, progress } : m)));
-      }
-
-      socket.emit(
-        "file-transfer-end",
-        { transferId, sessionCode },
-        (response: { ok: boolean; error?: string }) => {
-          setMessages((current) =>
-            current.map((m) =>
-              m.id === transferId
-                ? {
-                    ...m,
-                    status: response?.ok ? "delivered" : "failed",
-                    progress: 100,
-                  }
-                : m
-            )
-          );
-
-          if (response?.ok) {
-            logActivity(`Sent ${kind}: ${fileName}`, "good");
-          } else {
-            logActivity(`Failed to send ${fileName}`, "bad");
+        let response: { ok: boolean; error?: string };
+        while (true) {
+          try {
+            response = await emitWithAck<{ ok: boolean; error?: string }>(
+              "file-transfer-chunk",
+              { transferId, sessionCode, index: chunkIndex, data: chunk }
+            );
+            break;
+          } catch (error) {
+            if (error instanceof Error && error.message.includes("timeout") && chunkIndex > 0) {
+              setMessages((current) => current.map((m) => (m.id === transferId ? { ...m, status: "paused" } : m)));
+              await new Promise((resolve) => setTimeout(resolve, 1000));
+              continue;
+            }
+            throw error;
           }
         }
+        if (cancelledTransfersRef.current.has(transferId)) return;
+        if (!response.ok) throw new Error(response.error || "Chunk rejected");
+        const progress = Math.round(((chunkIndex + 1) / totalChunks) * 100);
+        setMessages((current) => current.map((m) => (m.id === transferId ? { ...m, progress, status: "sending" } : m)));
+      }
+
+      const endResponse = await emitWithAck<{ ok: boolean; error?: string }>(
+        "file-transfer-end",
+        { transferId, sessionCode }
       );
+      if (activeTransferId && cancelledTransfersRef.current.has(activeTransferId)) return;
+      setMessages((current) =>
+        current.map((m) =>
+          m.id === transferId
+            ? { ...m, status: endResponse.ok ? "completed" : "failed", progress: endResponse.ok ? 100 : m.progress }
+            : m
+        )
+      );
+      if (!endResponse.ok) {
+        logActivity(`Failed to send ${fileName}`, "bad");
+      } else {
+        logActivity(`Sent ${kind}: ${fileName}`, "good");
+      }
     } catch (error) {
+      if (activeTransferId && cancelledTransfersRef.current.has(activeTransferId)) return;
       console.warn("sendAttachment failed", error);
       Alert.alert("Couldn't send that", "Something went wrong reading the file.");
     }
@@ -1743,6 +1817,17 @@ export default function HomeScreen() {
                       </View>
                     )}
 
+                    {canCancelTransfer(chatMessage) ? (
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`Cancel transfer ${chatMessage.fileName ?? ""}`}
+                        style={styles.cancelTransferButton}
+                        onPress={() => cancelTransfer(chatMessage.transferId ?? chatMessage.id)}
+                      >
+                        <Text style={styles.cancelTransferText}>CANCEL</Text>
+                      </Pressable>
+                    ) : null}
+
                     {chatMessage.progress !== undefined && chatMessage.progress < 100 ? (
                       <View style={styles.progressTrack}>
                         <View style={[styles.progressFill, { width: `${chatMessage.progress}%` }]} />
@@ -1755,11 +1840,16 @@ export default function HomeScreen() {
                         <Text
                           style={[styles.statusText2, chatMessage.status === "failed" && styles.statusFailed]}
                         >
+                          {chatMessage.status === "preparing" && "Preparing…"}
                           {chatMessage.status === "sending" &&
                             (chatMessage.progress !== undefined && chatMessage.progress < 100
                               ? `○ ${chatMessage.progress}%`
                               : "○ sending…")}
+                          {chatMessage.status === "receiving" && `Receiving ${chatMessage.progress ?? 0}%`}
+                          {chatMessage.status === "paused" && `Paused ${chatMessage.progress ?? 0}%`}
                           {chatMessage.status === "delivered" && "✓✓ delivered"}
+                          {chatMessage.status === "completed" && "✓✓ completed"}
+                          {chatMessage.status === "cancelled" && "Cancelled"}
                           {chatMessage.status === "failed" && "⚠ failed — tap to retry"}
                         </Text>
                       ) : null}
@@ -2370,6 +2460,23 @@ const styles = StyleSheet.create({
   progressFill: {
     height: 4,
     backgroundColor: C.accent,
+  },
+
+  cancelTransferButton: {
+    alignSelf: "flex-start",
+    marginTop: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: R.sm,
+  },
+
+  cancelTransferText: {
+    color: C.textMuted,
+    fontFamily: mono,
+    fontSize: 10,
+    letterSpacing: 1,
   },
 
   bubbleFooter: {

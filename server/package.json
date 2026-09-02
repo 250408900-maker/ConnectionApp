@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test session-manager.test.js"
+    "test": "node --test session-manager.test.js transfer-manager.test.js"
   },
   "keywords": [],
   "author": "",
