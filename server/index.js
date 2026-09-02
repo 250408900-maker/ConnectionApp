@@ -1,6 +1,13 @@
 const express = require("express");
 const http = require("http");
+const crypto = require("node:crypto");
 const { Server } = require("socket.io");
+const {
+  credentials,
+  createSession,
+  matchesParticipant,
+  markOffline: markParticipantOffline,
+} = require("./session-manager");
 
 const app = express();
 const server = http.createServer(app);
@@ -17,21 +24,38 @@ const RECONNECT_GRACE_MS = 20000;
 
 function generateCode() {
   const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let code = "";
+  const bytes = crypto.randomBytes(6);
+  return Array.from(bytes, (value) => characters[value % characters.length]).join("");
+}
 
-  for (let i = 0; i < 6; i++) {
-    code += characters[Math.floor(Math.random() * characters.length)];
-  }
+function validToken(participant, participantId, reconnectToken) {
+  return matchesParticipant(participant, participantId, reconnectToken);
+}
 
-  return code;
+function expireParticipant(code, role) {
+  const session = sessions[code];
+  if (!session) return;
+  const participant = session[role];
+  if (!participant || participant.online) return;
+  participant.timer = null;
+  const peer = session[role === "host" ? "guest" : "host"];
+  if (peer && peer.online) io.to(peer.socketId).emit("peer-left");
+  if (role === "host") endSession(code, "expired");
+  else session.guest = null;
+}
+
+function markOffline(code, role) {
+  const session = sessions[code];
+  if (!session) return;
+  markParticipantOffline(session, role, expireParticipant);
 }
 
 function endSession(code, reason) {
   const session = sessions[code];
   if (!session) return;
 
-  if (session.timers.host) clearTimeout(session.timers.host);
-  if (session.timers.guest) clearTimeout(session.timers.guest);
+  if (session.host && session.host.timer) clearTimeout(session.host.timer);
+  if (session.guest && session.guest.timer) clearTimeout(session.guest.timer);
 
   io.to(code).emit("session-ended", reason || "closed");
   delete sessions[code];
@@ -43,8 +67,14 @@ function endSession(code, reason) {
 // the *other* device in that session (or null if there isn't one / it's not
 // currently connected).
 function getPeerSocketId(session, callerSocketId) {
-  const peerId = session.hostId === callerSocketId ? session.guestId : session.hostId;
-  return peerId || null;
+  const peer = session.host.socketId === callerSocketId ? session.guest : session.host;
+  return peer && peer.online ? peer.socketId : null;
+}
+
+function getRoleForSocket(session, socketId) {
+  if (session.host.socketId === socketId) return "host";
+  if (session.guest && session.guest.socketId === socketId) return "guest";
+  return null;
 }
 
 io.on("connection", (socket) => {
@@ -57,16 +87,10 @@ io.on("connection", (socket) => {
       code = generateCode();
     }
 
-    sessions[code] = {
-      hostId: socket.id,
-      guestId: null,
-      hostOnline: true,
-      guestOnline: false,
-      timers: { host: null, guest: null },
-    };
+    sessions[code] = createSession(code, socket.id);
 
     socket.join(code);
-    socket.emit("session-created", code);
+    socket.emit("session-created", { sessionCode: code, ...credentials(sessions[code].host) });
 
     console.log(`${socket.id} created session ${code}`);
   });
@@ -80,7 +104,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    if (session.hostId === socket.id) {
+    if (session.host.socketId === socket.id) {
       socket.emit(
         "join-error",
         "You already created this session. Join from another device."
@@ -88,16 +112,18 @@ io.on("connection", (socket) => {
       return;
     }
 
-    if (session.guestId && session.guestOnline) {
+    if (session.guest && session.guest.online) {
       socket.emit("join-error", "Session is already full.");
       return;
     }
 
-    session.guestId = socket.id;
-    session.guestOnline = true;
+    session.guest = {
+      ...createSession(cleanedCode, socket.id).host,
+      role: "guest",
+    };
     socket.join(cleanedCode);
 
-    socket.emit("join-success", cleanedCode);
+    socket.emit("join-success", { sessionCode: cleanedCode, ...credentials(session.guest) });
     io.to(cleanedCode).emit("session-connected", cleanedCode);
 
     console.log(`${socket.id} joined session ${cleanedCode}`);
@@ -165,7 +191,7 @@ socket.on("call-ended", ({ sessionCode }) => {
   io.to(peerId).emit("call-ended");
 });
 
-  socket.on("rejoin-session", ({ sessionCode, role }) => {
+  socket.on("rejoin-session", ({ sessionCode, role, participantId, reconnectToken }) => {
     const cleanedCode = String(sessionCode).trim().toUpperCase();
     const session = sessions[cleanedCode];
 
@@ -174,28 +200,34 @@ socket.on("call-ended", ({ sessionCode }) => {
       return;
     }
 
+    const participant = session[role];
+    if (!validToken(participant, participantId, reconnectToken)) {
+      socket.emit("rejoin-error", "Invalid reconnect credentials.");
+      return;
+    }
+
     if (role === "host") {
-      if (session.hostOnline) {
+      if (session.host.online) {
         socket.emit("rejoin-error", "Host slot already active.");
         return;
       }
-      session.hostId = socket.id;
-      session.hostOnline = true;
-      if (session.timers.host) {
-        clearTimeout(session.timers.host);
-        session.timers.host = null;
-      }
+      session.host.socketId = socket.id;
+      session.host.online = true;
+      if (session.host.timer) clearTimeout(session.host.timer);
+      session.host.timer = null;
     } else if (role === "guest") {
-      if (session.guestOnline) {
+      if (!session.guest) {
+        socket.emit("rejoin-error", "Guest slot has expired.");
+        return;
+      }
+      if (session.guest.online) {
         socket.emit("rejoin-error", "Guest slot already active.");
         return;
       }
-      session.guestId = socket.id;
-      session.guestOnline = true;
-      if (session.timers.guest) {
-        clearTimeout(session.timers.guest);
-        session.timers.guest = null;
-      }
+      session.guest.socketId = socket.id;
+      session.guest.online = true;
+      if (session.guest.timer) clearTimeout(session.guest.timer);
+      session.guest.timer = null;
     } else {
       socket.emit("rejoin-error", "Invalid role.");
       return;
@@ -204,7 +236,7 @@ socket.on("call-ended", ({ sessionCode }) => {
     socket.join(cleanedCode);
     socket.emit("rejoin-success", {
       sessionCode: cleanedCode,
-      peerOnline: role === "host" ? session.guestOnline : session.hostOnline,
+      peerOnline: role === "host" ? Boolean(session.guest && session.guest.online) : session.host.online,
     });
     socket.to(cleanedCode).emit("peer-reconnected");
 
@@ -217,8 +249,7 @@ socket.on("call-ended", ({ sessionCode }) => {
 
     if (!session) return;
 
-    const belongsToSession =
-      session.hostId === socket.id || session.guestId === socket.id;
+    const belongsToSession = getRoleForSocket(session, socket.id) !== null;
 
     if (!belongsToSession) return;
 
@@ -241,16 +272,15 @@ socket.on("call-ended", ({ sessionCode }) => {
       return;
     }
 
-    const belongsToSession =
-      session.hostId === socket.id || session.guestId === socket.id;
+    const belongsToSession = getRoleForSocket(session, socket.id) !== null;
 
     if (!belongsToSession) {
       ack({ ok: false, messageId, error: "You are not part of this session." });
       return;
     }
 
-    const peerOnline =
-      session.hostId === socket.id ? session.guestOnline : session.hostOnline;
+    const role = getRoleForSocket(session, socket.id);
+    const peerOnline = role === "host" ? Boolean(session.guest && session.guest.online) : session.host.online;
 
     if (!peerOnline) {
       ack({ ok: false, messageId, error: "Peer is not connected." });
@@ -269,8 +299,7 @@ socket.on("call-ended", ({ sessionCode }) => {
 
     if (!session) return;
 
-    const belongsToSession =
-      session.hostId === socket.id || session.guestId === socket.id;
+    const belongsToSession = getRoleForSocket(session, socket.id) !== null;
 
     if (!belongsToSession) return;
 
@@ -283,8 +312,7 @@ socket.on("call-ended", ({ sessionCode }) => {
 
     if (!session) return;
 
-    const belongsToSession =
-      session.hostId === socket.id || session.guestId === socket.id;
+    const belongsToSession = getRoleForSocket(session, socket.id) !== null;
 
     if (!belongsToSession) return;
 
@@ -320,12 +348,12 @@ socket.on("call-ended", ({ sessionCode }) => {
       if (!session) return;
 
       const belongsToSession =
-        session.hostId === socket.id || session.guestId === socket.id;
+        getRoleForSocket(session, socket.id) !== null;
 
       if (!belongsToSession) return;
 
-      const peerOnline =
-        session.hostId === socket.id ? session.guestOnline : session.hostOnline;
+      const role = getRoleForSocket(session, socket.id);
+      const peerOnline = role === "host" ? Boolean(session.guest && session.guest.online) : session.host.online;
 
       if (!peerOnline) return;
 
@@ -360,8 +388,7 @@ socket.on("call-ended", ({ sessionCode }) => {
         return;
       }
 
-      const belongsToSession =
-        session.hostId === socket.id || session.guestId === socket.id;
+      const belongsToSession = getRoleForSocket(session, socket.id) !== null;
 
       if (!belongsToSession) {
         ack({ ok: false });
@@ -397,8 +424,7 @@ socket.on("call-ended", ({ sessionCode }) => {
         return;
       }
   
-      const belongsToSession =
-        session.hostId === socket.id || session.guestId === socket.id;
+      const belongsToSession = getRoleForSocket(session, socket.id) !== null;
   
       if (!belongsToSession) {
         ack({ ok: false, error: "Not part of this session" });
@@ -422,29 +448,22 @@ socket.on("call-ended", ({ sessionCode }) => {
     for (const code of Object.keys(sessions)) {
       const session = sessions[code];
 
-      if (session.hostId === socket.id && session.hostOnline) {
-        session.hostOnline = false;
+      if (session.host.socketId === socket.id && session.host.online) {
+        markOffline(code, "host");
 
-        if (!session.guestId) {
+        if (!session.guest) {
           // No one ever joined — just clean up immediately.
           endSession(code, "closed");
           break;
         }
 
         socket.to(code).emit("peer-offline");
-        session.timers.host = setTimeout(() => {
-          endSession(code, "timeout");
-        }, RECONNECT_GRACE_MS);
         break;
       }
 
-      if (session.guestId === socket.id && session.guestOnline) {
-        session.guestOnline = false;
-
+      if (session.guest && session.guest.socketId === socket.id && session.guest.online) {
+        markOffline(code, "guest");
         socket.to(code).emit("peer-offline");
-        session.timers.guest = setTimeout(() => {
-          endSession(code, "timeout");
-        }, RECONNECT_GRACE_MS);
         break;
       }
     }

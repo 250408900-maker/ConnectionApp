@@ -4,6 +4,7 @@ export const SERVER_URL = "http://130.61.28.42:3000";
 
 export const socket = io(SERVER_URL, {
   transports: ["websocket"],
+  autoConnect: false,
   reconnection: true,
   reconnectionAttempts: 5,
   reconnectionDelay: 1000,

@@ -26,7 +26,13 @@ import {
   DashboardRadii as R,
 } from "@/constants/dashboard-theme";
 import { socket } from "@/constants/socket";
-import { resetSharedSessionState, setSharedSessionState } from "@/constants/session-state";
+import {
+  loadPersistedSession,
+  persistSession,
+  resetSharedSessionState,
+  setSharedSessionState,
+  type SessionSnapshot,
+} from "@/constants/session-state";
 // ---- WebRTC platform shim ----
 // react-native-webrtc is a native module and cannot run on web. On web we
 // use the browser's built-in WebRTC globals instead. On native we lazily
@@ -49,6 +55,7 @@ async function getMicStream(): Promise<any> {
   if (isWeb) {
     return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
   }
+
   const { mediaDevices } = require("react-native-webrtc");
   return mediaDevices.getUserMedia({ audio: true, video: false });
 }
@@ -267,6 +274,8 @@ export default function HomeScreen() {
   const isTypingRef = useRef(false);
   const roleRef = useRef<"host" | "guest" | null>(null);
   const sessionCodeRef = useRef("");
+  const participantIdRef = useRef<string | null>(null);
+  const reconnectTokenRef = useRef<string | null>(null);
   const pairedAtRef = useRef<number | null>(null);
   const notificationSoundRef = useRef<Audio.Sound | null>(null);
   const voiceSoundRef = useRef<Audio.Sound | null>(null);
@@ -317,7 +326,7 @@ export default function HomeScreen() {
   }, [peerOnline]);
 
   const syncSharedSessionState = useCallback(
-    (patch: Partial<{ connected: boolean; sessionCode: string | null; peerConnected: boolean }> = {}) => {
+    (patch: Partial<SessionSnapshot> = {}) => {
       setSharedSessionState({
         connected: socket.connected,
         sessionCode: sessionCodeRef.current || null,
@@ -418,8 +427,11 @@ export default function HomeScreen() {
       setPeerOnline(false);
       setPeerTyping(false);
       roleRef.current = null;
+      participantIdRef.current = null;
+      reconnectTokenRef.current = null;
       incomingTransfersRef.current = {};
       resetSharedSessionState();
+      void persistSession(null);
       cleanupCall();
     }
 
@@ -431,6 +443,8 @@ export default function HomeScreen() {
         socket.emit("rejoin-session", {
           sessionCode: sessionCodeRef.current,
           role: roleRef.current,
+          participantId: participantIdRef.current,
+          reconnectToken: reconnectTokenRef.current,
         });
       } else {
         setLinkState("online");
@@ -459,24 +473,63 @@ export default function HomeScreen() {
       logActivity("Auto-reconnect gave up — try manually", "bad");
     }
 
-    function handleSessionCreated(code: string) {
+    function handleSessionCreated(payload: {
+      sessionCode: string;
+      participantId: string;
+      reconnectToken: string;
+      role: "host" | "guest";
+    }) {
+      const code = payload.sessionCode;
       roleRef.current = "host";
+      participantIdRef.current = payload.participantId;
+      reconnectTokenRef.current = payload.reconnectToken;
       setSessionCode(code);
       setLinkState("waiting");
       setMessages([]);
       setPeerOnline(false);
       setPeerTyping(false);
-      syncSharedSessionState({ sessionCode: code, peerConnected: false });
+      syncSharedSessionState({
+        sessionCode: code,
+        peerConnected: false,
+        participantId: payload.participantId,
+        reconnectToken: payload.reconnectToken,
+        role: payload.role,
+      });
+      void persistSession({
+        sessionCode: code,
+        participantId: payload.participantId,
+        reconnectToken: payload.reconnectToken,
+        role: payload.role,
+      });
       logActivity(`Channel created: ${code}`, "good");
     }
 
-    function handleJoinSuccess(code: string) {
+    function handleJoinSuccess(payload: {
+      sessionCode: string;
+      participantId: string;
+      reconnectToken: string;
+      role: "host" | "guest";
+    }) {
+      const code = payload.sessionCode;
       roleRef.current = "guest";
+      participantIdRef.current = payload.participantId;
+      reconnectTokenRef.current = payload.reconnectToken;
       setSessionCode(code);
       setLinkState("paired");
       setMessages([]);
       setPeerTyping(false);
-      syncSharedSessionState({ sessionCode: code });
+      syncSharedSessionState({
+        sessionCode: code,
+        participantId: payload.participantId,
+        reconnectToken: payload.reconnectToken,
+        role: payload.role,
+      });
+      void persistSession({
+        sessionCode: code,
+        participantId: payload.participantId,
+        reconnectToken: payload.reconnectToken,
+        role: payload.role,
+      });
       logActivity(`Tuned in to channel ${code}`, "good");
     }
 
@@ -498,6 +551,12 @@ export default function HomeScreen() {
       setLinkState("paired");
       setPeerOnline(payload.peerOnline);
       syncSharedSessionState({ sessionCode: payload.sessionCode, peerConnected: payload.peerOnline });
+      void persistSession({
+        sessionCode: payload.sessionCode,
+        participantId: participantIdRef.current!,
+        reconnectToken: reconnectTokenRef.current!,
+        role: roleRef.current!,
+      });
       logActivity("Rejoined channel after reconnect", "good");
     }
 
@@ -519,6 +578,13 @@ export default function HomeScreen() {
       setPeerOnline(true);
       syncSharedSessionState({ peerConnected: true });
       logActivity("Peer reconnected", "good");
+    }
+
+    function handlePeerLeft() {
+      setPeerOnline(false);
+      setPeerTyping(false);
+      syncSharedSessionState({ peerConnected: false });
+      logActivity("Peer left the channel", "bad");
     }
 
     function handleReceiveMessage(receivedMessage: string) {
@@ -700,6 +766,7 @@ export default function HomeScreen() {
     socket.on("rejoin-error", handleRejoinError);
     socket.on("peer-offline", handlePeerOffline);
     socket.on("peer-reconnected", handlePeerReconnected);
+    socket.on("peer-left", handlePeerLeft);
     socket.on("receive-message", handleReceiveMessage);
     socket.on("file-transfer-start", handleFileTransferStart);
     socket.on("file-transfer-chunk", handleFileTransferChunk);
@@ -714,9 +781,18 @@ export default function HomeScreen() {
     socket.on("call-ice-candidate", handleCallIceCandidate);
     socket.on("call-ended", handleCallEndedRemote);
 
-    if (socket.connected) {
-      handleConnect();
-    }
+    void loadPersistedSession().then((saved) => {
+      if (saved) {
+        sessionCodeRef.current = saved.sessionCode;
+        participantIdRef.current = saved.participantId;
+        reconnectTokenRef.current = saved.reconnectToken;
+        roleRef.current = saved.role;
+        setSessionCode(saved.sessionCode);
+        setLinkState("reconnecting");
+        setSharedSessionState({ sessionCode: saved.sessionCode });
+      }
+      socket.connect();
+    });
 
     return () => {
       socket.off("connect", handleConnect);
@@ -731,6 +807,7 @@ export default function HomeScreen() {
       socket.off("rejoin-error", handleRejoinError);
       socket.off("peer-offline", handlePeerOffline);
       socket.off("peer-reconnected", handlePeerReconnected);
+      socket.off("peer-left", handlePeerLeft);
       socket.off("receive-message", handleReceiveMessage);
       socket.off("file-transfer-start", handleFileTransferStart);
       socket.off("file-transfer-chunk", handleFileTransferChunk);
